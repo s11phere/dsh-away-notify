@@ -1,0 +1,46 @@
+{
+  "name": "dsh-away-notify",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DSH plugin: Codex-like desktop notifications that fire only when you are away. Native Windows Toast for both native-Windows and WSL dsh, with session deep-link on click.",
+  "type": "module",
+  "license": "MIT",
+  "main": "./lib/host.js",
+  "exports": {
+    ".": "./lib/host.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=22.5"
+  },
+  "files": [
+    "lib",
+    "scripts",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "selftest": "node scripts/selftest-notify.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "notify",
+    "toast",
+    "windows",
+    "wsl",
+    "notification"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  }
+}

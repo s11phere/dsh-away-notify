@@ -1,0 +1,19 @@
+# 依赖与产物
+node_modules/
+*.tgz
+
+# 运行期诊断输出
+*.log
+dsh-away-notify.log
+
+# 本地缓存（协议注册、pnpm/npm 等）
+.npm-cache/
+.pnpm-store/
+.corepack/
+.cache/
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

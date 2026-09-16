@@ -1,0 +1,18 @@
+# dsh-away-notify bundle patch.
+#
+# 声明本插件的宿主侧 loader 入口。`insert:` 行随包发布，因此
+# `dsh plugin --profile web add <本包>` 会自动把它追加进该 profile 的
+# `dsh.profile.bundles`，**不需要**再手写同 id 的 `- insert:`（会报
+# duplicate loader entry id）。
+#
+# `name` 是裸包名，由 loader 的两段解析（先 dsh 安装目录，再 profile 的
+# node_modules）落到本包的 main / exports["."]，即 lib/host.js。
+# 浏览器半部由 package.json 的 `dsh.client` 声明 + `exports["./client"]`
+# 自动被 dsh-client-modules 发现，无需在此声明。
+#
+# 安装：dsh plugin --profile web add <包目录或包名>
+# 之后重启 dsh web 并刷新页面。
+
+- insert:
+    - id: dsh-away-notify
+      name: 'dsh-away-notify'
