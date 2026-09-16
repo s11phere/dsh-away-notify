@@ -29,7 +29,24 @@ $ErrorActionPreference = 'Stop'
 
 # Single instance: a reload can race a still-running helper, and the loser must
 # not start processing the same requests.
-$mutex = New-Object System.Threading.Mutex($false, 'Local\dsh-away-notify-focus-helper')
+#
+# The name is scoped to the spool directory, not global. Instances that share a
+# spool (native-Windows dsh and WSL dsh pointed at the same checkout do) must
+# share one helper; but an instance configured with a different spoolDir must get
+# its own. With a globally named mutex the second instance's helper would lose the
+# lock and exit, and then the first instance's unload (it writes spool/stop) would
+# take the only helper down, forcing the other instance's clicks onto the cold
+# path until the enqueue script notices the stale heartbeat and restarts it.
+$trimChars = [char[]]@(92, 47)   # backslash and slash
+$spoolKey = $SpoolDir.TrimEnd($trimChars).ToLowerInvariant()
+$sha1 = [System.Security.Cryptography.SHA1]::Create()
+try {
+  $digest = $sha1.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($spoolKey))
+} finally {
+  $sha1.Dispose()
+}
+$suffix = ([System.BitConverter]::ToString($digest) -replace '-', '').Substring(0, 12)
+$mutex = New-Object System.Threading.Mutex($false, ('Local\dsh-away-notify-focus-helper-' + $suffix))
 $ownsMutex = $false
 try { $ownsMutex = $mutex.WaitOne(0) } catch { $ownsMutex = $false }
 if (-not $ownsMutex) { exit 0 }

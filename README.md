@@ -252,6 +252,43 @@ dsh plugin --profile web add /path/to/dsh-away-notify
 dsh --profile web --dump-config | grep -A2 dsh-away-notify
 ```
 
+### Windows 上必须先看这一节（跨盘符会装出坏插件）
+
+在 Windows 上，只要**插件检出与 `$DSH_HOME`（默认 `C:\Users\<你>\.dsh`）不在同一个盘符**，
+上面那条 `dsh plugin add` 就会**静默装出一个永远不会加载的插件**：
+
+- pnpm 的 `hoisted` nodeLinker（由 dsh 的 profile 模板自己写进 `pnpm-workspace.yaml`）
+  会把 `link:` 的**绝对路径当成相对路径**解析，于是建出的 junction 指向
+  `C:\Users\<你>\.dsh\profiles\web\F:\project\...\dsh-away-notify`
+  —— profile 目录被硬拼在绝对路径前面，包根本解析不到；
+- 包解析不到 → `dsh plugin` 认为它「没有声明 `dsh.bundle`」，于是**不把它加进
+  `dsh.profile.bundles`**，并打一条**方向完全错误**的 warning：
+
+  ```
+  dsh: warning: dsh-away-notify declares no dsh.bundle - installed as a plain dependency
+  ```
+
+- 更糟的是**命令退出码是 0**。而且**它还会把已经注册好的 bundle 删掉**：重跑一次
+  `pnpm install` / `dsh plugin add` 会让一个原本工作正常的安装从
+  `dsh.profile.bundles` 里消失。也就是说「重装一次」等于「把插件悄悄卸掉」。
+
+**用这个脚本装**（它会跑正常命令，然后**校验**结果并修好 pnpm 弄坏的东西）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install-windows.ps1
+```
+
+它会：跑 `dsh plugin add` → 检查 junction 是否真能解析 → 坏了就用 `rmdir` + `mklink /J`
+重建（**绝不 `Remove-Item -Recurse`**：PS 5.1 会顺着 junction 把目标内容删掉，也就是
+把你的插件源码删了）→ 确认包名在 `dsh.profile.bundles` 里 → 用 `--dump-config` 复验。
+`-WhatIfOnly` 只报告不改动，`-Profile <名字>` 可指定别的 profile。
+
+**想根治**（让原版 `dsh plugin add` 也能用）二选一：
+
+1. 把插件检出放到与 `$DSH_HOME` **同一个盘符**；或
+2. 把 profile 的 `pnpm-workspace.yaml` 里 `nodeLinker: hoisted` 改成 `isolated`
+   （实测跨盘符可用；但 `hoisted` 是 dsh 模板刻意选的，改动前想清楚）。
+
 ### 首次接线自检
 
 在 profile 的 `cordis.patch.yml` 里打开自检，重启后应立刻收到一条「通知已就绪」的 Toast：
@@ -365,6 +402,7 @@ dsh 的 Web UI 在端口上要求鉴权（裸访问返回 `401 dsh web authentic
 | `scripts/focus-or-open.ps1` | 一次性处理器：助手不可用时的冷回退，也可手工调试 |
 | `scripts/run-hidden.vbs` | 无窗口闪烁启动 PowerShell（助手启动与冷回退共用） |
 | `scripts/selftest-notify.mjs` | 脱离 dsh 单独验证通知通道并回读通知中心 |
+| `scripts/install-windows.ps1` | Windows 安装器：跑 `dsh plugin add` 后校验并修好 pnpm 在跨盘符时弄坏的 junction 与 bundle 注册（见「Windows 上必须先看这一节」） |
 
 `policy.js` / `presence.js` / `notifier.js` 都不依赖 DSH 运行时，因此可以脱离 dsh 单测：
 
@@ -404,12 +442,12 @@ node --test
 - 同一条通知被点开后，若走的是**新开标签页**那条路，新页面会先落回上次选中的会话、约 1 秒后才切到目标会话（因为 URL 参数在鉴权重定向时被丢弃，只能由页面加载后主动索取）。实测日志可见这一跳转。
 - **持久通知依赖 `scenario="reminder"` + 一个按钮**：Windows 会忽略没有按钮的 reminder 场景（退化成普通通知，几秒后收走）。插件因此在持久化时总会带上按钮。另外 `reminder` 通知不会被 Focus Assist / 勿扰静默掉，这是系统行为。
 - **`titleTag` 会改写标签页标题**：这是多实例精确聚焦的代价（`… — DeepSeek Harness [dsh:3081]`）。不喜欢可以设 `titleTag: false`，代价是多个实例并存时会认错窗口。
-- **焦点助手是个常驻 PowerShell 进程**（约 50-70MB），这是把点击端到端从 2.1s 降到 ~0.1-0.2s 的代价，见「点击延迟」。它用命名互斥量保证单实例，插件卸载时会收到 `stop` 并退出。若它意外死亡，下一次点击会把它拉起来（这一次约 1.4s），之后恢复 ~0.2s。
+- **焦点助手是个常驻 PowerShell 进程**（约 50-70MB），这是把点击端到端从 2.1s 降到 ~0.1-0.2s 的代价，见「点击延迟」。互斥量**按 spool 目录区分**（`Local\dsh-away-notify-focus-helper-<spool 目录的短哈希>`）：共用同一个 spool 的多个实例（Windows 原生 + WSL 指向同一份检出）**共享**一个助手，而配了不同 `spoolDir` 的实例各自有一个。插件卸载时会往自己的 spool 写 `stop` 让它退出——所以**共用 spool 的实例之间仍会互相影响**：一方卸载/重载会把共享的那个助手带走，下一次点击由 `enqueue-focus.vbs` 检测到心跳过期后重新拉起（约 1.4s），之后恢复 ~0.2s。若助手意外死亡，行为同上。
 - **助手重载期间可能有一次慢点击**：插件 HMR 重载时旧助手收到 `stop` 退出、新助手可能因互斥量抢先失败而退出，于是下一次点击要等心跳过期后重新拉起。只影响一次。
 - 普通 Linux 桌面依赖 `notify-send`（多数发行版需自行安装 `libnotify-bin`）；WSL 下不需要，直接走 Windows Toast。Linux 上持久化用 `notify-send -u critical -t 0` 近似，但**撤回通知没有通用通道**，`dismissOnReturn` 在 Linux 上不生效。
 - presence 端点的注册清理绑定在 connection 服务的 fiber 上（框架语义），HMR 重载插件时端点可能不会随之注销，但重复注册是覆盖语义，不会报错。
 - 多标签页同时打开时，每个标签页都会独立上报（这是设计如此，多标签都能各自被抑制），因此切换标签页时日志会有较多上报记录。
-- **测试有两处真实副作用，都已用替身挡住**：在 WSL 下 `detectPlatform()` 判为 wsl，宿主测试原本会真的弹通知，也会真的写 `HKCU\Software\Classes\dshnotify`。现在统一把 `DSH_NOTIFY_POWERSHELL` 指向静默替身，并把 `spoolDir` 指到临时目录；新增会触发通知或注册协议的用例时请沿用这两个约定。
+- **测试不产生真实副作用**：宿主测试通过 `apply(ctx, config, deps)` 的第三个参数注入假的 `spawnImpl` / `spawnSyncImpl`，因此既不会真的弹通知，也不会真的写 `HKCU\Software\Classes\dshnotify`，`spoolDir` 也指向临时目录。**这不是可选的洁癖**：早期版本把一段 `#!/bin/sh` 脚本写成 `powershell.exe` 再让宿主去执行它，在 Linux/macOS 上能跑，但在 Windows 上**必然失败**（Windows 只把 `.exe` 当 PE 映像加载、不认 shebang），四条依赖「脚本真的发出去了」的用例会永远红。新增会触发通知或注册协议的用例时，请通过 `applyHost(ctx, config, fake.deps)` 沿用这条通路。
 
 ---
 

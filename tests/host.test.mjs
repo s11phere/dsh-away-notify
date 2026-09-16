@@ -4,7 +4,8 @@
  */
 import { after, afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { EventEmitter } from 'node:events';
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -21,8 +22,13 @@ const PRESENCE_PATH = '/api/dsh-away-notify';
 const TEST_SPOOL = mkdtempSync(join(tmpdir(), 'dshan-spool-'));
 after(() => rmSync(TEST_SPOOL, { recursive: true, force: true }));
 
-/** apply 的测试包装：默认把 spool 指向临时目录，避免污染插件目录。 */
-const applyHost = (ctx, config = {}) => apply(ctx, { spoolDir: TEST_SPOOL, ...config });
+/**
+ * apply 的测试包装：默认把 spool 指向临时目录，避免污染插件目录；默认注入静默
+ * 的 spawn 替身，保证用例永远不会真的弹通知或写注册表。需要观察「到底执行了
+ * 哪段脚本」的用例传入自己的 `fake.deps`。
+ */
+const applyHost = (ctx, config = {}, deps = SILENT_DEPS) =>
+  apply(ctx, { spoolDir: TEST_SPOOL, ...config }, deps);
 
 /** 每个测试创建的 ctx 在结束后统一 dispose，否则 sweep 定时器会吊住事件循环。 */
 const created = [];
@@ -296,72 +302,88 @@ test('五类触发 + 关键行为默认值正确', () => {
 
 // ── 实例区分与持久通知的端到端接线 ──────────────────────────────────────────
 //
-// 通知/撤回在 Linux 测试机上本来无处落地，所以这里把宿主伪装成 Windows，
-// 并塞一个假的 powershell.exe 进 PATH 位置：它把每次 `-EncodedCommand` 的
-// 明文记进日志，于是「到底发没发 reminder、回没回 History.Remove」可被断言。
+// 通知/撤回在测试环境里本来无处落地，所以这里把宿主伪装成 Windows，并在 **spawn
+// 这一层**塞一个替身：它把每次 `-EncodedCommand` 的明文记进日志，于是「到底发没
+// 发 reminder、回没回 History.Remove」可被断言。
+//
+// 关键约束（Windows 上实测踩到）：**不能**靠「写一个假的 powershell.exe 让操作
+// 系统去执行」——Windows 只把 `.exe` 当 PE 映像加载、完全不认 shebang，那条路在
+// Windows 上必然失败，四条依赖「脚本真的发出去了」的用例会永远红。所以 host.js
+// 的 apply() 开了第三个参数，把 spawnImpl / spawnSyncImpl 透传下去。
 
 /**
- * 造一个假 powershell：对任何调用都回成功标记，可选地把 `-EncodedCommand`
- * 的明文记进日志（供断言「到底发出了什么」）。
+ * 造一个假的 spawn 实现：不依赖操作系统真的能执行什么，因此三个平台行为一致。
  *
- * 路径特意摆成 `.../WindowsPowerShell/v1.0/powershell.exe`：`deriveWscriptPath`
- * 正是按这个形状推出 wscript.exe 的，而注册命令只有在推得出 wscript 时才会走
- * enqueue 快路径。顺手放一个同级的空 wscript.exe，免得宿主启动助手时报错。
+ * 断言的内容与旧版完全一样（`-EncodedCommand` 的明文、成功标记、退出码），只是
+ * 不再要求 OS 能执行一个假 powershell。
+ *
+ * `psPath` 只是个**形状正确**的路径字符串（`.../WindowsPowerShell/v1.0/powershell.exe`）：
+ * 用来让 `detectPlatform()` 报出 Windows 形态、让 `deriveWscriptPath()` 推出
+ * wscript，从而走 enqueue 注册分支。磁盘上并不需要真的存在该文件——它永远不会
+ * 被真的执行。早期版本还要顺手放一个空的 wscript.exe，现在也不需要了。
  *
  * @param {{ silent?: boolean }} [opts] - silent 时不落日志，只保证不真弹窗。
  */
-function makeFakePowerShell({ silent = false } = {}) {
+function makeFakeSpawn({ silent = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'dshan-ps-'));
   const logPath = join(dir, 'calls.log');
-  const psDir = join(dir, 'WindowsPowerShell', 'v1.0');
-  mkdirSync(psDir, { recursive: true });
-  const psPath = join(psDir, 'powershell.exe');
-  const wscriptPath = join(dir, 'WindowsPowerShell', 'wscript.exe');
-  writeFileSync(wscriptPath, '#!/bin/sh\nexit 0\n');
-  chmodSync(wscriptPath, 0o755);
-  writeFileSync(
-    psPath,
-    silent
-      ? `#!/bin/sh
-echo TOAST_SHOWN
-echo DISMISSED
-echo REGISTERED
-exit 0
-`
-      : `#!/bin/sh
-LOG=${JSON.stringify(logPath)}
-enc=""
-prev=""
-for a in "$@"; do
-  if [ "$prev" = "-EncodedCommand" ]; then enc="$a"; fi
-  prev="$a"
-done
-if [ -n "$enc" ]; then printf '%s\\n' "$enc" >> "$LOG"; fi
-echo TOAST_SHOWN
-echo DISMISSED
-echo REGISTERED
-exit 0
-`,
-  );
-  chmodSync(psPath, 0o755);
-  return { logPath, psPath, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+
+  const spawnImpl = (cmd, args) => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.kill = () => {};
+    child.unref = () => {};
+    if (!silent) {
+      const i = Array.isArray(args) ? args.indexOf('-EncodedCommand') : -1;
+      if (i >= 0 && typeof args[i + 1] === 'string') appendFileSync(logPath, `${args[i + 1]}\n`);
+    }
+    // 监听器是在 spawn 返回之后才挂上的，所以事件要推迟到下一个 tick 再发。
+    setImmediate(() => {
+      child.stdout.emit('data', 'TOAST_SHOWN\nDISMISSED\nREGISTERED\n');
+      child.emit('close', 0);
+    });
+    return child;
+  };
+
+  /**
+   * `toWindowsPath` 会去调 `wslpath`。这里把它的行为固定下来，免得用例结果随宿主
+   * 平台漂移：`/mnt/<盘>/...` 按 `wslpath -w` 的规则转换（WSL 上真实会走的分支），
+   * 其余一律报告「没有 wslpath」→ 原样返回（原生 Windows 的真实情形）。
+   */
+  const spawnSyncImpl = (cmd, args) => {
+    const input = Array.isArray(args) ? args[args.length - 1] : '';
+    const m = typeof input === 'string' ? /^\/mnt\/([a-z])\/(.*)$/i.exec(input) : null;
+    if (m) return { status: 0, stdout: `${m[1].toUpperCase()}:\\${m[2].replace(/\//g, '\\')}\n` };
+    return { status: 1, stdout: '', stderr: '' };
+  };
+
+  return {
+    dir,
+    logPath,
+    psPath: join(dir, 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+    deps: { spawnImpl, spawnSyncImpl },
+    cleanup: () => rmSync(dir, { recursive: true, force: true }),
+  };
 }
 
 /**
- * 这台机器上 `detectPlatform()` 会判定为 **wsl**（/proc/version 含 microsoft，
- * 且 /mnt/c 下有 powershell.exe），所以宿主测试里每一条「应当通知」的用例都会
- * 真的弹到桌面上。统一把 powershell 指到一个静默替身，测试才不会打扰用户。
+ * 默认替身：没有显式传 deps 的用例也一律走假的 spawn，于是测试**永远不会**真的弹
+ * 通知，也不会真的去写 `HKCU\Software\Classes\dshnotify`（注册走的也是同一条假
+ * spawn）。`DSH_NOTIFY_POWERSHELL` 只用来给 `detectPlatform()` 一个形状正确的
+ * Windows 路径，让注册命令走 enqueue 分支。
  */
 const REAL_PS_ENV = process.env.DSH_NOTIFY_POWERSHELL;
-const SILENT_PS = makeFakePowerShell({ silent: true });
-process.env.DSH_NOTIFY_POWERSHELL = SILENT_PS.psPath;
+const SILENT = makeFakeSpawn({ silent: true });
+const SILENT_DEPS = SILENT.deps;
+process.env.DSH_NOTIFY_POWERSHELL = SILENT.psPath;
 after(() => {
-  SILENT_PS.cleanup();
+  SILENT.cleanup();
   if (REAL_PS_ENV === undefined) delete process.env.DSH_NOTIFY_POWERSHELL;
   else process.env.DSH_NOTIFY_POWERSHELL = REAL_PS_ENV;
 });
 
-/** 读出假 powershell 收到的全部脚本明文。 */
+/** 读出假 spawn 收到的全部脚本明文。 */
 function readScripts(logPath) {
   if (!existsSync(logPath)) return [];
   return readFileSync(logPath, 'utf8')
@@ -371,7 +393,7 @@ function readScripts(logPath) {
     .map((l) => Buffer.from(l, 'base64').toString('utf16le'));
 }
 
-/** 把当前进程伪装成 Windows 并指向假 powershell，返回还原函数。 */
+/** 把当前进程伪装成 Windows 并指向形状正确的 powershell 路径，返回还原函数。 */
 function pretendWindows(psPath) {
   const realPlatform = process.platform;
   const realPs = process.env.DSH_NOTIFY_POWERSHELL;
@@ -387,11 +409,11 @@ function pretendWindows(psPath) {
 const settle = () => new Promise((r) => setTimeout(r, 150));
 
 test('通知以 reminder 场景发出，带回跳 tag（持久停留）', async () => {
-  const fake = makeFakePowerShell();
+  const fake = makeFakeSpawn();
   const restore = pretendWindows(fake.psPath);
   try {
     const ctx = makeCtx();
-    applyHost(ctx, {});
+    applyHost(ctx, {}, fake.deps);
     ctx.sessions.add(session('s1'));
     ctx.emit('session/event', ctx.sessions.get('s1'), turnEnd());
     await settle();
@@ -408,11 +430,11 @@ test('通知以 reminder 场景发出，带回跳 tag（持久停留）', async 
 });
 
 test('用户回到 dsh 页面时按 tag 撤回持久通知', async () => {
-  const fake = makeFakePowerShell();
+  const fake = makeFakeSpawn();
   const restore = pretendWindows(fake.psPath);
   try {
     const ctx = makeCtx();
-    applyHost(ctx, {});
+    applyHost(ctx, {}, fake.deps);
     ctx.sessions.add(session('s1'));
     ctx.emit('session/event', ctx.sessions.get('s1'), turnEnd());
     await settle();
@@ -434,11 +456,11 @@ test('用户回到 dsh 页面时按 tag 撤回持久通知', async () => {
 });
 
 test('只是失焦可见（人在别的应用）不会撤回通知', async () => {
-  const fake = makeFakePowerShell();
+  const fake = makeFakeSpawn();
   const restore = pretendWindows(fake.psPath);
   try {
     const ctx = makeCtx();
-    applyHost(ctx, {});
+    applyHost(ctx, {}, fake.deps);
     ctx.sessions.add(session('s1'));
     ctx.emit('session/event', ctx.sessions.get('s1'), turnEnd());
     await settle();
@@ -457,11 +479,11 @@ test('只是失焦可见（人在别的应用）不会撤回通知', async () =>
 });
 
 test('别的会话在前台（含心跳）不会撤掉本会话的通知', async () => {
-  const fake = makeFakePowerShell();
+  const fake = makeFakeSpawn();
   const restore = pretendWindows(fake.psPath);
   try {
     const ctx = makeCtx();
-    applyHost(ctx, {});
+    applyHost(ctx, {}, fake.deps);
     ctx.sessions.add(session('s1'));
     ctx.sessions.add(session('s2'));
     ctx.emit('session/event', ctx.sessions.get('s1'), turnEnd());
@@ -495,11 +517,11 @@ test('别的会话在前台（含心跳）不会撤掉本会话的通知', async
 });
 
 test('dismissOnReturn=false 时不撤回', async () => {
-  const fake = makeFakePowerShell();
+  const fake = makeFakeSpawn();
   const restore = pretendWindows(fake.psPath);
   try {
     const ctx = makeCtx();
-    applyHost(ctx, { dismissOnReturn: false });
+    applyHost(ctx, { dismissOnReturn: false }, fake.deps);
     ctx.sessions.add(session('s1'));
     ctx.emit('session/event', ctx.sessions.get('s1'), turnEnd());
     await settle();
@@ -576,11 +598,11 @@ test('加载时会清掉上一次残留的 stop（否则新助手一起来就自
 });
 
 test('注册表命令指向 enqueue 脚本并带上 spool：点击路径上没有 PowerShell', async () => {
-  const fake = makeFakePowerShell();
+  const fake = makeFakeSpawn();
   const restore = pretendWindows(fake.psPath);
   try {
     const ctx = makeCtx();
-    applyHost(ctx);
+    applyHost(ctx, {}, fake.deps);
     await settle();
     const registerScript = readScripts(fake.logPath).find((s) => s.includes('dshnotify'));
     assert.ok(registerScript, '应发出注册脚本');

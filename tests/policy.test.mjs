@@ -42,7 +42,15 @@ test('rootsOnly=false 时子代理也通知', () => {
 });
 
 test('五类触发默认全部开启', () => {
-  for (const k of ['turn-complete', 'turn-error', 'turn-max-tokens', 'approval', 'question', 'goal-complete']) {
+  for (const k of [
+    'turn-complete',
+    'turn-error',
+    'turn-aborted',
+    'turn-max-tokens',
+    'approval',
+    'question',
+    'goal-complete',
+  ]) {
     assert.equal(isKindEnabled(k, DEFAULT_POLICY), true, `${k} 应默认开启`);
   }
 });

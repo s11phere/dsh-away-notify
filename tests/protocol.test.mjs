@@ -62,19 +62,38 @@ test('中文 URL 往返正确', () => {
 });
 
 // ── 路径转换 ────────────────────────────────────────────────────────────────
+//
+// 这两条显式传入 platform：否则它们在「原生 Windows」和「WSL」上走的是不同
+// 分支（Windows 会短路、WSL 才会去调 wslpath），断言就依赖宿主平台了。
 
 test('toWindowsPath 在 wslpath 可用时采用其输出', () => {
   assert.equal(
-    toWindowsPath('/mnt/f/project/x.ps1', { spawnSyncImpl: () => ({ status: 0, stdout: 'F:\\project\\x.ps1\n' }) }),
+    toWindowsPath('/mnt/f/project/x.ps1', {
+      platform: 'linux',
+      spawnSyncImpl: () => ({ status: 0, stdout: 'F:\\project\\x.ps1\n' }),
+    }),
     'F:\\project\\x.ps1',
   );
 });
 
-test('toWindowsPath 在 wslpath 不可用时原样返回（原生 Windows）', () => {
+test('toWindowsPath 在 wslpath 不可用时原样返回', () => {
   const boom = () => {
     throw new Error('ENOENT');
   };
-  assert.equal(toWindowsPath('C:\\plugins\\x.ps1', { spawnSyncImpl: boom }), 'C:\\plugins\\x.ps1');
+  assert.equal(toWindowsPath('C:\\plugins\\x.ps1', { platform: 'linux', spawnSyncImpl: boom }), 'C:\\plugins\\x.ps1');
+});
+
+test('toWindowsPath 在原生 Windows 上短路，不再白起 wslpath 子进程', () => {
+  let called = false;
+  const spy = () => {
+    called = true;
+    return { status: 0, stdout: 'SHOULD_NOT_BE_USED\n' };
+  };
+  assert.equal(
+    toWindowsPath('F:\\project\\tools\\plugin\\.focus-spool', { platform: 'win32', spawnSyncImpl: spy }),
+    'F:\\project\\tools\\plugin\\.focus-spool',
+  );
+  assert.equal(called, false, 'win32 上不该为了转换去 spawnSync 任何东西');
 });
 
 test('deriveWscriptPath 从 WSL 形式与 Windows 形式的 powershell 推出 wscript', () => {
@@ -280,6 +299,20 @@ test('focus-helper.ps1 是常驻的：事件驱动 + 单实例 + 心跳 + 可停
   assert.match(src, /stop/, '插件卸载时助手要能退出');
 });
 
+test('焦点助手的互斥量按 spool 目录区分，而不是全局一个', () => {
+  // 真机踩到：Windows 原生 dsh 与 WSL dsh 并存时两边解析到同一个 spool，
+  // 全局互斥量本身没问题；但一旦某个实例配了不同的 spoolDir，它就会永远抢不到
+  // 锁、永远没有助手。更糟的是另一边卸载时写的 stop 会把唯一的助手带走。
+  const src = readScript('focus-helper.ps1');
+  assert.match(src, /\$SpoolDir/, '互斥量名必须由 spool 目录推导');
+  assert.doesNotMatch(
+    src,
+    /'Local\\dsh-away-notify-focus-helper'/,
+    '不得再用与 spool 无关的固定名字',
+  );
+  assert.match(src, /ComputeHash/, '用稳定哈希把目录折进名字（不能用 GetHashCode，跨进程不稳定）');
+});
+
 test('enqueue-focus.vbs 不起 PowerShell，且具备兜底与自愈', () => {
   const src = readScript('enqueue-focus.vbs');
   assert.match(src, /CreateTextFile/, '点击只写一个请求文件');
@@ -302,8 +335,11 @@ test('run-hidden.vbs 是纯 ASCII 且以隐藏窗口方式启动 PowerShell', ()
 test('回归：注册命令里所有路径都必须是 Windows 形式，且走 wscript', async () => {
   // 真机踩到过两件事：命令里写成 /mnt/c/... 时 ShellExecute 直接失败；
   // 直接调 powershell 会闪控制台。
+  // platform 显式给 linux：这条模拟的是「宿主在 WSL」，否则在原生 Windows 上
+  // toWindowsPath 会短路，测的就不是同一条分支了。
   let captured = '';
   const res = await registerProtocol({
+    platform: 'linux',
     powershell: PS_WSL,
     scriptPath: '/mnt/f/p/focus-or-open.ps1',
     vbsPath: '/mnt/f/p/run-hidden.vbs',
@@ -332,6 +368,7 @@ test('回归：注册命令里所有路径都必须是 Windows 形式，且走 w
 
 test('注册失败时返回 ok=false 且带可读原因（不是空字符串）', async () => {
   const res = await registerProtocol({
+    platform: 'linux',
     powershell: '/mnt/c/ps.exe',
     scriptPath: '/mnt/f/x.ps1',
     vbsPath: '/mnt/f/x.vbs',
