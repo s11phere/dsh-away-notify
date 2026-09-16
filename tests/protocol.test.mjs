@@ -251,6 +251,17 @@ test('focus-lib.ps1 记住上次命中的窗口：标签不在前台时不新开
   assert.match(src, /FromCache/, '应把「来自缓存」透出来，便于诊断');
 });
 
+test('focus-lib.ps1 用 UI Automation 选中 dsh 标签页（标签不在前台也能回去）', () => {
+  const src = readScript('focus-lib.ps1');
+  // 窗口标题只反映当前标签页；只有 UIA 才能列出并选中浏览器自己的标签项，
+  // 「点击通知后真的回到 dsh」靠的就是它。
+  assert.match(src, /UIAutomationClient/, '应加载 UI Automation');
+  assert.match(src, /ControlType\]::TabItem/, '应按 TabItem 枚举标签页');
+  assert.match(src, /Select-DshTab/, '应有独立的标签页查找/选中函数');
+  assert.match(src, /SelectionItemPattern|InvokePattern/, '应通过 UIA pattern 选中标签页');
+  assert.match(src, /Chrome_WidgetWin/, '应只对浏览器窗口做 UIA 遍历');
+});
+
 test('focus-or-open.ps1 与 focus-helper.ps1 共用同一份逻辑，不各写一遍', () => {
   for (const name of ['focus-or-open.ps1', 'focus-helper.ps1']) {
     const src = readScript(name);
