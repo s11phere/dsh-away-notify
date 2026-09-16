@@ -1,88 +1,29 @@
-# focus-or-open.ps1 - handler for the dshnotify: protocol
+# focus-or-open.ps1 - one-shot handler for the dshnotify: protocol.
 #
-# Invoked by Windows when a toast notification is clicked (registered under
-# HKCU\Software\Classes\dshnotify). Behaviour:
-#   1. find a browser window whose title contains the DSH marker -> restore if
-#      minimized and bring it to the foreground
-#   2. none found -> open the target URL with the default browser
+# This is the FALLBACK path. A click normally goes through enqueue-focus.vbs ->
+# the resident focus-helper.ps1, because a cold PowerShell costs ~2s (see the
+# README section on click latency). This script is still what runs when the
+# helper is unavailable, and it is also handy for manual testing:
 #
-# The argument is a URI of the form `dshnotify:<base64url>` whose payload is the
-# target URL. base64 is used instead of plain text so that `&`, quotes and `%`
-# in the URL cannot be mangled between the command line, the registry and
-# ShellExecute.
+#   powershell -File focus-or-open.ps1 -Uri "dshnotify:<base64url>" `
+#       -Marker "DeepSeek Harness" -TagMode port
 #
-# THIS FILE MUST STAY PURE ASCII: Windows PowerShell 5.1 reads a .ps1 without a
-# BOM using the ANSI code page, and any non-ASCII character makes it fail to
-# parse the whole script.
+# The actual behaviour lives in focus-lib.ps1, shared with the helper so the
+# fast path and the fallback can never drift apart.
+#
+# THIS FILE MUST STAY PURE ASCII (see focus-lib.ps1 for why).
 
 param(
   [Parameter(Mandatory = $true)][string]$Uri,
-  [string]$Marker = 'DeepSeek Harness'
+  [string]$Marker = 'DeepSeek Harness',
+  [string]$TagMode = 'port'
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'focus-lib.ps1')
 
-# --- decode dshnotify:<base64url> -------------------------------------------
-$payload = $Uri
-if ($payload.StartsWith('dshnotify:')) { $payload = $payload.Substring(10) }
-$payload = $payload.TrimStart('/')
-$b64 = $payload.Replace('-', '+').Replace('_', '/')
-switch ($b64.Length % 4) {
-  2 { $b64 += '==' }
-  3 { $b64 += '=' }
-}
-$url = ''
-if ($b64.Length -gt 0) {
-  try { $url = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64)) } catch { $url = '' }
-}
+$status = Invoke-DshFocus -Uri $Uri -Marker $Marker -TagMode $TagMode
+Write-Output $status
 
-# --- Win32 foreground focus --------------------------------------------------s
-Add-Type -Namespace DshNotify -Name Native -MemberDefinition @'
-[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
-[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-[DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
-[DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
-[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
-[DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
-[DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
-'@
-
-function Focus-Window([IntPtr]$handle) {
-  if ([DshNotify.Native]::IsIconic($handle)) { [void][DshNotify.Native]::ShowWindow($handle, 9) }
-  $foreground = [DshNotify.Native]::GetForegroundWindow()
-  $foreignPid = 0
-  $foreignThread = [DshNotify.Native]::GetWindowThreadProcessId($foreground, [ref]$foreignPid)
-  $ownThread = [DshNotify.Native]::GetCurrentThreadId()
-  # Foreground lock: attaching to the current foreground thread's input queue
-  # makes SetForegroundWindow succeed far more reliably.
-  [void][DshNotify.Native]::AttachThreadInput($ownThread, $foreignThread, $true)
-  [void][DshNotify.Native]::BringWindowToTop($handle)
-  $ok = [DshNotify.Native]::SetForegroundWindow($handle)
-  [void][DshNotify.Native]::AttachThreadInput($ownThread, $foreignThread, $false)
-  return $ok
-}
-
-# --- locate a browser window that shows dsh ---------------------------------
-$candidates = @()
-foreach ($procName in @('msedge', 'chrome', 'firefox')) {
-  $candidates += Get-Process -Name $procName -ErrorAction SilentlyContinue
-}
-$windows = @($candidates | Where-Object { $_.MainWindowHandle -ne 0 })
-$target = $windows | Where-Object { $_.MainWindowTitle -like "*$Marker*" } | Select-Object -First 1
-
-if ($null -ne $target) {
-  $focused = Focus-Window $target.MainWindowHandle
-  Write-Output ('FOCUSED hwnd=' + $target.MainWindowHandle + ' ok=' + $focused)
-  exit 0
-}
-
-# --- no existing dsh window: hand the URL to the default browser ------------
-if ($url.Length -gt 0) {
-  Start-Process $url | Out-Null
-  Write-Output 'OPENED'
-  exit 0
-}
-
-Write-Output 'NOOP no-url-no-window'
+if ($status.Contains('FOCUSED') -or $status.Contains('OPENED')) { exit 0 }
 exit 1

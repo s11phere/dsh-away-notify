@@ -90,28 +90,68 @@ test('deriveWscriptPath 对意外的 powershell 路径返回 null', () => {
 
 // ── 注册命令 ────────────────────────────────────────────────────────────────
 
-test('命令走 wscript + VBS，避免 PowerShell 控制台闪烁', () => {
-  const cmd = buildProtocolCommand({ powershell: PS_WIN, scriptPath: PS1, vbsPath: VBS });
+const ENQUEUE = 'F:\\p\\enqueue-focus.vbs';
+const SPOOL = 'F:\\p\\.focus-spool';
+
+test('enqueue 模式：注册表直接指向 VBS，点击路径上没有 PowerShell', () => {
+  const cmd = buildProtocolCommand({
+    powershell: PS_WIN,
+    enqueueVbs: ENQUEUE,
+    spoolDir: SPOOL,
+  });
+  assert.ok(cmd.startsWith('"C:\\Windows\\System32\\wscript.exe"'), `应由 wscript 启动：${cmd}`);
+  assert.match(cmd, /"F:\\p\\enqueue-focus\.vbs"/);
+  assert.match(cmd, /"%1"/);
+  assert.match(cmd, /"F:\\p\\\.focus-spool"$/);
+  assert.doesNotMatch(cmd, /powershell/i, '快路径不该出现 powershell');
+  assert.doesNotMatch(cmd, /focus-or-open/, '快路径不该直接调冷脚本');
+});
+
+test('enqueue 模式参数不全时退回 direct（不至于注册出坏命令）', () => {
+  const cmd = buildProtocolCommand({ mode: 'enqueue', powershell: PS_WIN, scriptPath: PS1, vbsPath: VBS });
+  assert.match(cmd, /"F:\\p\\focus-or-open\.ps1"/);
+});
+
+test('direct 模式走 wscript + run-hidden.vbs，避免 PowerShell 控制台闪烁', () => {
+  const cmd = buildProtocolCommand({ mode: 'direct', powershell: PS_WIN, scriptPath: PS1, vbsPath: VBS });
   assert.ok(cmd.startsWith('"C:\\Windows\\System32\\wscript.exe"'), `应由 wscript 启动：${cmd}`);
   assert.match(cmd, /"F:\\p\\run-hidden\.vbs"/);
   assert.match(cmd, /"F:\\p\\focus-or-open\.ps1"/);
-  assert.match(cmd, /"%1"$/);
+  assert.match(cmd, /-Uri "%1"/);
   assert.doesNotMatch(cmd, /-WindowStyle/, '不该再直接调 powershell');
 });
 
-test('命令带上 marker 作为参数', () => {
-  const cmd = buildProtocolCommand({ powershell: PS_WIN, scriptPath: PS1, vbsPath: VBS, marker: 'DeepSeek Harness' });
-  assert.match(cmd, /"DeepSeek Harness"$/);
+test('direct 命令带上 marker 与 tagMode 作为命名参数', () => {
+  const cmd = buildProtocolCommand({
+    mode: 'direct',
+    powershell: PS_WIN,
+    scriptPath: PS1,
+    vbsPath: VBS,
+    marker: 'DeepSeek Harness',
+  });
+  assert.match(cmd, /-Marker "DeepSeek Harness" -TagMode "port"$/, `默认应要求端口 tag：${cmd}`);
+});
+
+test('tagMode=off 时也如实传下去（退回旧行为）', () => {
+  const cmd = buildProtocolCommand({
+    mode: 'direct',
+    powershell: PS_WIN,
+    scriptPath: PS1,
+    vbsPath: VBS,
+    marker: 'DeepSeek Harness',
+    tagMode: 'off',
+  });
+  assert.match(cmd, /-TagMode "off"$/);
 });
 
 test('推不出 wscript 时退回直接调用 powershell（会闪，但不至于不可用）', () => {
-  const cmd = buildProtocolCommand({ powershell: 'powershell.exe', scriptPath: PS1 });
+  const cmd = buildProtocolCommand({ mode: 'direct', powershell: 'powershell.exe', scriptPath: PS1 });
   assert.match(cmd, /^"powershell\.exe" -NoProfile/);
   assert.match(cmd, /-WindowStyle Hidden/);
 });
 
 test('路径里的双引号被剔除，不会破坏命令行', () => {
-  const cmd = buildProtocolCommand({ powershell: PS_WIN, scriptPath: 'F:\\p"x.ps1', vbsPath: VBS });
+  const cmd = buildProtocolCommand({ mode: 'direct', powershell: PS_WIN, scriptPath: 'F:\\p"x.ps1', vbsPath: VBS });
   assert.doesNotMatch(cmd, /p"x\.ps1/);
 });
 
@@ -151,23 +191,77 @@ test('注销脚本删除 HKCU 下的协议键', () => {
 
 // ── 随包脚本 ────────────────────────────────────────────────────────────────
 
-test('focus-or-open.ps1 是纯 ASCII 且包含聚焦与兜底打开逻辑', () => {
-  const src = readFileSync(new URL('../scripts/focus-or-open.ps1', import.meta.url), 'utf8');
-  // eslint-disable-next-line no-control-regex
-  assert.match(src, /^[\x00-\x7F]*$/, '不得包含非 ASCII 字符（PS 5.1 会解析失败）');
+/** 读 scripts/ 下的脚本源码。 */
+const readScript = (name) => readFileSync(new URL(`../scripts/${name}`, import.meta.url), 'utf8');
+const ASCII_ONLY = /^[\x00-\x7F]*$/;
+
+test('所有随包脚本都是纯 ASCII（PS 5.1 无 BOM 读取的前提）', () => {
+  for (const name of [
+    'focus-lib.ps1',
+    'focus-or-open.ps1',
+    'focus-helper.ps1',
+    'enqueue-focus.vbs',
+    'run-hidden.vbs',
+  ]) {
+    // eslint-disable-next-line no-control-regex
+    assert.match(readScript(name), ASCII_ONLY, `${name} 不得包含非 ASCII 字符`);
+  }
+});
+
+test('focus-lib.ps1 包含真正的聚焦与兜底打开逻辑', () => {
+  const src = readScript('focus-lib.ps1');
   assert.match(src, /dshnotify:/);
   assert.match(src, /SetForegroundWindow/);
+  assert.match(src, /AttachThreadInput/, '前台锁要靠 AttachThreadInput 绕开');
   assert.match(src, /IsIconic/);
   assert.match(src, /Start-Process \$url/);
 });
 
+test('focus-lib.ps1 用字面包含而非 -like（否则[]会被当成字符集，tag 过滤失效）', () => {
+  const src = readScript('focus-lib.ps1');
+  // 真机踩到过：-like "*[dsh:3080]*" 只要求标题含 d/s/h/:/3/0/8 其中一个字符，
+  // 于是任何 dsh 窗口都能匹配上，实例区分完全失效。
+  assert.match(
+    src,
+    /IndexOf\(\$Needle, \[System\.StringComparison\]::OrdinalIgnoreCase\)/,
+    'marker 与 tag 都必须走字面匹配',
+  );
+  assert.doesNotMatch(src, /-like\s+"\*\$(tag|Marker)\*"/, '标题匹配不得再用 -like 包住变量');
+});
+
+test('focus-or-open.ps1 与 focus-helper.ps1 共用同一份逻辑，不各写一遍', () => {
+  for (const name of ['focus-or-open.ps1', 'focus-helper.ps1']) {
+    const src = readScript(name);
+    assert.match(src, /focus-lib\.ps1/, `${name} 应 dot-source 共享库`);
+    assert.match(src, /Invoke-DshFocus/, `${name} 应调用共享入口`);
+    assert.doesNotMatch(src, /SetForegroundWindow/, `${name} 不该再自带一份 P/Invoke`);
+  }
+});
+
+test('focus-helper.ps1 是常驻的：事件驱动 + 单实例 + 心跳 + 可停止', () => {
+  const src = readScript('focus-helper.ps1');
+  assert.match(src, /FileSystemWatcher/, '用事件唤醒而不是忙轮询，否则常驻会白烧 CPU');
+  assert.match(src, /WaitForChanged/);
+  assert.match(src, /Mutex/, '单实例，避免重载时两个助手抢同一批请求');
+  assert.match(src, /heartbeat/, '心跳让 enqueue 脚本能判断助手是否活着');
+  assert.match(src, /stop/, '插件卸载时助手要能退出');
+});
+
+test('enqueue-focus.vbs 不起 PowerShell，且具备兜底与自愈', () => {
+  const src = readScript('enqueue-focus.vbs');
+  assert.match(src, /CreateTextFile/, '点击只写一个请求文件');
+  assert.match(src, /MoveFile/, '先写临时名再改名，避免助手读到半个文件');
+  assert.match(src, /heartbeat/, '要检查助手是否还活着');
+  assert.doesNotMatch(src, /-EncodedCommand/, '不该有 PowerShell 负载');
+  assert.match(src, /focus-or-open/, '助手不在时要能退回冷路径');
+});
+
 test('run-hidden.vbs 是纯 ASCII 且以隐藏窗口方式启动 PowerShell', () => {
-  const src = readFileSync(new URL('../scripts/run-hidden.vbs', import.meta.url), 'utf8');
-  // eslint-disable-next-line no-control-regex
-  assert.match(src, /^[\x00-\x7F]*$/, '不得包含非 ASCII 字符');
+  const src = readScript('run-hidden.vbs');
   assert.match(src, /WScript\.Shell/);
   assert.match(src, /shell\.Run cmd, 0, False/, '0 = 隐藏窗口，False = 不等待');
   assert.match(src, /powershell\.exe/);
+  assert.match(src, /args\.Count - 1/, '参数要透传，助手启动也复用它');
 });
 
 // ── registerProtocol ────────────────────────────────────────────────────────

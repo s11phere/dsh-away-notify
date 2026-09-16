@@ -1,8 +1,41 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { detectPlatform, detectWsl, findWindowsPowerShellFromWsl, __internals } from '../lib/notifier.js';
+import { detectPlatform, detectWsl, findWindowsPowerShellFromWsl, dismiss, notify, __internals } from '../lib/notifier.js';
 
 const { b64, encodeCommand, renderTemplate } = __internals;
+
+/**
+ * 假的 spawn：捕获真正传给 PowerShell 的 `-EncodedCommand` 脚本明文，
+ * 这样不用真跑 PowerShell 就能断言模板渲染结果。
+ */
+function fakeSpawn(captured, { stdout = 'TOAST_SHOWN\r\n', code = 0 } = {}) {
+  return (cmd, args) => {
+    const i = args.indexOf('-EncodedCommand');
+    const encoded = i >= 0 ? args[i + 1] : '';
+    captured.push({
+      cmd,
+      args,
+      script: encoded ? Buffer.from(encoded, 'base64').toString('utf16le') : '',
+    });
+    const handlers = {};
+    const child = {
+      stdout: { on: (_ev, fn) => (handlers.stdout = fn) },
+      stderr: { on: (_ev, fn) => (handlers.stderr = fn) },
+      on: (ev, fn) => (handlers[ev] = fn),
+      kill: () => {},
+      unref: () => {},
+    };
+    // 监听器是在 spawn 返回之后才挂上的，所以必须异步触发
+    setImmediate(() => {
+      handlers.stdout?.(stdout);
+      handlers.close?.(code);
+    });
+    return child;
+  };
+}
+
+const WSL_TARGET = { kind: 'wsl', powershell: 'powershell.exe' };
+const WIN_TARGET = { kind: 'windows', powershell: 'powershell.exe' };
 
 test('detectWsl: 通过 WSL_DISTRO_NAME 识别', () => {
   assert.equal(detectWsl('', { WSL_DISTRO_NAME: 'Ubuntu' }), true);
@@ -94,4 +127,107 @@ test('PS 模板包含提示音开关与 Toast 通用模板', () => {
   assert.match(__internals.PS_TEMPLATE, /ms-winsoundevent:Notification\.Default/);
   assert.match(__internals.PS_TEMPLATE, /ToastGeneric/);
   assert.match(__internals.PS_TEMPLATE, /activationType/);
+});
+
+test('撤回模板是纯 ASCII 且走 History.Remove', () => {
+  // eslint-disable-next-line no-control-regex
+  assert.match(__internals.PS_DISMISS_TEMPLATE, /^[\x00-\x7F]*$/);
+  assert.match(__internals.PS_DISMISS_TEMPLATE, /History\.Remove/);
+  assert.match(__internals.PS_DISMISS_TEMPLATE, /History\.Clear/);
+});
+
+// ── 持久化通知 ──────────────────────────────────────────────────────────────
+
+test('persistent=true 渲染出 reminder 场景、按钮与 tag/group', async () => {
+  const captured = [];
+  const res = await notify({
+    title: '标题',
+    body: '正文',
+    launch: 'dshnotify:abc',
+    appId: 'App',
+    persistent: true,
+    tag: 'dshan-1',
+    group: 'dshan',
+    target: WSL_TARGET,
+    spawnImpl: fakeSpawn(captured),
+  });
+
+  assert.equal(res.ok, true);
+  const s = captured[0].script;
+  assert.doesNotMatch(s, /__[A-Z]+_B64__/, '占位符必须全部替换');
+  assert.ok(s.includes(b64('reminder')), '应带 scenario=reminder');
+  assert.ok(s.includes(b64('long')), '应带 duration=long 兜底');
+  assert.match(s, /<actions>/, 'reminder 必须配按钮，否则会被系统忽略');
+  assert.ok(s.includes(b64('dshan-1')), '应带上 tag 以便之后撤回');
+  assert.ok(s.includes(b64('dshan')), '应带上 group');
+  assert.match(s, /\$toast\.Tag/);
+  assert.match(s, /\$toast\.Group/);
+});
+
+test('persistent=false 不带 reminder 场景（保持原有行为）', async () => {
+  const captured = [];
+  await notify({ title: 'T', body: 'B', appId: 'App', target: WSL_TARGET, spawnImpl: fakeSpawn(captured) });
+  const s = captured[0].script;
+  assert.ok(!s.includes(b64('reminder')), '默认不该带 reminder');
+  assert.ok(!s.includes(b64('long')));
+});
+
+test('没有 launch 时持久通知用 system/dismiss 按钮', async () => {
+  const captured = [];
+  await notify({ title: 'T', body: 'B', appId: 'App', persistent: true, target: WIN_TARGET, spawnImpl: fakeSpawn(captured) });
+  const s = captured[0].script;
+  // 无 URL 时脚本内部把激活参数直接设成字面量 "dismiss"（system 激活）
+  assert.match(s, /"dismiss"/, '无 URL 时应退回可关闭的按钮');
+  assert.match(s, /"system"/);
+});
+
+test('有 launch 时持久通知的按钮用 protocol 激活到该 URL', async () => {
+  const captured = [];
+  await notify({
+    title: 'T',
+    body: 'B',
+    launch: 'dshnotify:zzz',
+    persistent: true,
+    target: WIN_TARGET,
+    spawnImpl: fakeSpawn(captured),
+  });
+  const s = captured[0].script;
+  assert.ok(s.includes(b64('dshnotify:zzz')));
+  assert.match(s, /"protocol"/);
+});
+
+// ── 撤回 ────────────────────────────────────────────────────────────────────
+
+test('dismiss 按 tag+group 精确撤回（不是整表清理）', async () => {
+  const captured = [];
+  const res = await dismiss({
+    appId: 'App',
+    tag: 'dshan-1',
+    group: 'dshan',
+    target: WSL_TARGET,
+    spawnImpl: fakeSpawn(captured, { stdout: 'DISMISSED\r\n' }),
+  });
+  assert.equal(res.ok, true);
+  const s = captured[0].script;
+  assert.ok(s.includes(b64('dshan-1')));
+  assert.ok(s.includes(b64('dshan')));
+  assert.match(s, /History\.Remove\(\$tag, \$group, \$appId\)/);
+});
+
+test('dismiss 成功与否看 DISMISSED 标记而不是退出码', async () => {
+  const captured = [];
+  const res = await dismiss({
+    appId: 'App',
+    tag: 't',
+    group: 'g',
+    target: WIN_TARGET,
+    spawnImpl: fakeSpawn(captured, { stdout: '' }),
+  });
+  assert.equal(res.ok, false, '没有 DISMISSED 标记时不能算成功');
+});
+
+test('dismiss 在非 Windows 平台明确报告不支持', async () => {
+  const res = await dismiss({ target: { kind: 'linux', powershell: null } });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /not supported/);
 });

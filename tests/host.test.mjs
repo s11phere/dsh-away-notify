@@ -2,12 +2,27 @@
  * host.test.mjs — 用假 ctx 驱动宿主插件，验证「事件 → 决策 → 通知」全链路。
  * 不依赖真实 DSH 运行时，也不会真的弹窗（通过注入的假 ctx 只验证到 policy 层）。
  */
-import { test, afterEach } from 'node:test';
+import { after, afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const { apply, DEFAULTS } = await import('../lib/host.js');
 
 const PRESENCE_PATH = '/api/dsh-away-notify';
+
+/**
+ * 每个测试套件用一个临时 spool 目录。
+ *
+ * 宿主会在 spool 里写 config.txt 并拉起常驻焦点助手；让它落在插件源码树里既脏，
+ * 又可能干扰真实运行中的助手（点击时 enqueue 脚本读到的会是测试留下的 config）。
+ */
+const TEST_SPOOL = mkdtempSync(join(tmpdir(), 'dshan-spool-'));
+after(() => rmSync(TEST_SPOOL, { recursive: true, force: true }));
+
+/** apply 的测试包装：默认把 spool 指向临时目录，避免污染插件目录。 */
+const applyHost = (ctx, config = {}) => apply(ctx, { spoolDir: TEST_SPOOL, ...config });
 
 /** 每个测试创建的 ctx 在结束后统一 dispose，否则 sweep 定时器会吊住事件循环。 */
 const created = [];
@@ -114,7 +129,7 @@ const reportPresence = (ctx, sessionId, visible, focused) =>
 
 test('加载后注册 session/event、user-questions/request 与 presence 端点', () => {
   const ctx = makeCtx();
-  apply(ctx, {});
+  applyHost(ctx, {});
   assert.ok(ctx.logs.some(([lvl, msg]) => lvl === 'info' && /已加载/.test(msg)));
   assert.ok(ctx.fetchRoutes.has(PRESENCE_PATH), 'presence 端点应注册在 /api 前缀下');
   assert.match(PRESENCE_PATH, /^\/api\//);
@@ -122,7 +137,7 @@ test('加载后注册 session/event、user-questions/request 与 presence 端点
 
 test('presence 端点记录在场状态，state 可回读', async () => {
   const ctx = makeCtx();
-  apply(ctx, {});
+  applyHost(ctx, {});
   await reportPresence(ctx, 's1', true, true);
   const { status, body } = await callEndpoint(ctx, { op: 'state' });
   assert.equal(status, 200);
@@ -131,7 +146,7 @@ test('presence 端点记录在场状态，state 可回读', async () => {
 
 test('切走标签页后不再视为在场', async () => {
   const ctx = makeCtx();
-  apply(ctx, {});
+  applyHost(ctx, {});
   await reportPresence(ctx, 's1', true, true);
   await reportPresence(ctx, 's1', false, false);
   const { body } = await callEndpoint(ctx, { op: 'state' });
@@ -140,7 +155,7 @@ test('切走标签页后不再视为在场', async () => {
 
 test('可见但失焦视为离开（焦点在别的应用）', async () => {
   const ctx = makeCtx();
-  apply(ctx, {});
+  applyHost(ctx, {});
   await reportPresence(ctx, 's1', true, false);
   const { body } = await callEndpoint(ctx, { op: 'state' });
   assert.equal(body.attended, null);
@@ -148,14 +163,14 @@ test('可见但失焦视为离开（焦点在别的应用）', async () => {
 
 test('非法 payload 不抛异常，返回 400', async () => {
   const ctx = makeCtx();
-  apply(ctx, {});
+  applyHost(ctx, {});
   assert.equal((await reportPresence(ctx, 42, true, true)).status, 200, '非字符串 sessionId 只是被忽略');
   assert.equal((await callEndpoint(ctx, { op: 'nope' })).status, 400);
 });
 
 test('不带 sessionId 的上报进入页面级退化模式', async () => {
   const ctx = makeCtx();
-  apply(ctx, {});
+  applyHost(ctx, {});
   // 模拟浏览器拿不到当前会话的场景
   const res = await callEndpoint(ctx, { op: 'presence', visible: true, focused: true });
   assert.equal(res.status, 200);
@@ -167,7 +182,7 @@ test('不带 sessionId 的上报进入页面级退化模式', async () => {
 
 test('页面不可见时退化模式也不抑制', async () => {
   const ctx = makeCtx();
-  apply(ctx, {});
+  applyHost(ctx, {});
   await callEndpoint(ctx, { op: 'presence', visible: false, focused: false });
   const { body } = await callEndpoint(ctx, { op: 'state' });
   assert.equal(body.mode, 'away');
@@ -176,7 +191,7 @@ test('页面不可见时退化模式也不抑制', async () => {
 
 test('端点透传 clientId：同一标签页切换会话后原会话立刻恢复提醒', async () => {
   const ctx = makeCtx();
-  apply(ctx, {});
+  applyHost(ctx, {});
   const send = (sessionId) =>
     callEndpoint(ctx, { op: 'presence', clientId: 'tab1', sessionId, visible: true, focused: true });
 
@@ -191,7 +206,7 @@ test('端点透传 clientId：同一标签页切换会话后原会话立刻恢�
 
 test('非 JSON 请求体返回 400', async () => {
   const ctx = makeCtx();
-  apply(ctx, {});
+  applyHost(ctx, {});
   const route = ctx.fetchRoutes.get(PRESENCE_PATH);
   const request = new Request(`http://127.0.0.1:3081${PRESENCE_PATH}`, { method: 'POST', body: 'not json' });
   const response = await route.fetch(request);
@@ -200,7 +215,7 @@ test('非 JSON 请求体返回 400', async () => {
 
 test('user-questions/request 必须继续 waterfall（调用 next）', () => {
   const ctx = makeCtx();
-  apply(ctx, {});
+  applyHost(ctx, {});
   ctx.sessions.add(session('s1'));
   let called = false;
   ctx.emit(
@@ -216,7 +231,7 @@ test('user-questions/request 必须继续 waterfall（调用 next）', () => {
 
 test('user-questions/request 内部抛错也仍然调用 next()', () => {
   const ctx = makeCtx();
-  apply(ctx, {});
+  applyHost(ctx, {});
   ctx.sessionTitle = {
     get() {
       throw new Error('projection boom');
@@ -233,7 +248,7 @@ test('user-questions/request 内部抛错也仍然调用 next()', () => {
 
 test('缺少 agent 的提问请求不会崩，也不会误发通知', () => {
   const ctx = makeCtx();
-  apply(ctx, {});
+  applyHost(ctx, {});
   let called = false;
   ctx.emit('user-questions/request', { questions: [{ question: 'x' }] }, () => {
     called = true;
@@ -244,13 +259,13 @@ test('缺少 agent 的提问请求不会崩，也不会误发通知', () => {
 
 test('未知事件类型被安全忽略', () => {
   const ctx = makeCtx();
-  apply(ctx, {});
+  applyHost(ctx, {});
   assert.doesNotThrow(() => ctx.emit('session/event', session('s1'), { type: 'nope/event', data: {} }));
 });
 
 test('缺少 session.id 的事件被忽略', () => {
   const ctx = makeCtx();
-  apply(ctx, {});
+  applyHost(ctx, {});
   assert.doesNotThrow(() => ctx.emit('session/event', {}, turnEnd()));
 });
 
@@ -273,12 +288,283 @@ test('五类触发 + 关键行为默认值正确', () => {
   assert.equal(DEFAULTS.sound, true);
   assert.equal(DEFAULTS.notifyOnLoad, false);
   assert.equal(DEFAULTS.debug, false);
+  // 持久通知与实例区分：默认开
+  assert.equal(DEFAULTS.persistent, true, '通知应默认一直停留');
+  assert.equal(DEFAULTS.titleTag, true, '默认应打实例标题 tag');
+  assert.equal(DEFAULTS.dismissOnReturn, true, '默认回到 dsh 时撤回通知');
+});
+
+// ── 实例区分与持久通知的端到端接线 ──────────────────────────────────────────
+//
+// 通知/撤回在 Linux 测试机上本来无处落地，所以这里把宿主伪装成 Windows，
+// 并塞一个假的 powershell.exe 进 PATH 位置：它把每次 `-EncodedCommand` 的
+// 明文记进日志，于是「到底发没发 reminder、回没回 History.Remove」可被断言。
+
+/**
+ * 造一个假 powershell：对任何调用都回成功标记，可选地把 `-EncodedCommand`
+ * 的明文记进日志（供断言「到底发出了什么」）。
+ *
+ * 路径特意摆成 `.../WindowsPowerShell/v1.0/powershell.exe`：`deriveWscriptPath`
+ * 正是按这个形状推出 wscript.exe 的，而注册命令只有在推得出 wscript 时才会走
+ * enqueue 快路径。顺手放一个同级的空 wscript.exe，免得宿主启动助手时报错。
+ *
+ * @param {{ silent?: boolean }} [opts] - silent 时不落日志，只保证不真弹窗。
+ */
+function makeFakePowerShell({ silent = false } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'dshan-ps-'));
+  const logPath = join(dir, 'calls.log');
+  const psDir = join(dir, 'WindowsPowerShell', 'v1.0');
+  mkdirSync(psDir, { recursive: true });
+  const psPath = join(psDir, 'powershell.exe');
+  const wscriptPath = join(dir, 'WindowsPowerShell', 'wscript.exe');
+  writeFileSync(wscriptPath, '#!/bin/sh\nexit 0\n');
+  chmodSync(wscriptPath, 0o755);
+  writeFileSync(
+    psPath,
+    silent
+      ? `#!/bin/sh
+echo TOAST_SHOWN
+echo DISMISSED
+echo REGISTERED
+exit 0
+`
+      : `#!/bin/sh
+LOG=${JSON.stringify(logPath)}
+enc=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-EncodedCommand" ]; then enc="$a"; fi
+  prev="$a"
+done
+if [ -n "$enc" ]; then printf '%s\\n' "$enc" >> "$LOG"; fi
+echo TOAST_SHOWN
+echo DISMISSED
+echo REGISTERED
+exit 0
+`,
+  );
+  chmodSync(psPath, 0o755);
+  return { logPath, psPath, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
+/**
+ * 这台机器上 `detectPlatform()` 会判定为 **wsl**（/proc/version 含 microsoft，
+ * 且 /mnt/c 下有 powershell.exe），所以宿主测试里每一条「应当通知」的用例都会
+ * 真的弹到桌面上。统一把 powershell 指到一个静默替身，测试才不会打扰用户。
+ */
+const REAL_PS_ENV = process.env.DSH_NOTIFY_POWERSHELL;
+const SILENT_PS = makeFakePowerShell({ silent: true });
+process.env.DSH_NOTIFY_POWERSHELL = SILENT_PS.psPath;
+after(() => {
+  SILENT_PS.cleanup();
+  if (REAL_PS_ENV === undefined) delete process.env.DSH_NOTIFY_POWERSHELL;
+  else process.env.DSH_NOTIFY_POWERSHELL = REAL_PS_ENV;
+});
+
+/** 读出假 powershell 收到的全部脚本明文。 */
+function readScripts(logPath) {
+  if (!existsSync(logPath)) return [];
+  return readFileSync(logPath, 'utf8')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0)
+    .map((l) => Buffer.from(l, 'base64').toString('utf16le'));
+}
+
+/** 把当前进程伪装成 Windows 并指向假 powershell，返回还原函数。 */
+function pretendWindows(psPath) {
+  const realPlatform = process.platform;
+  const realPs = process.env.DSH_NOTIFY_POWERSHELL;
+  Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+  process.env.DSH_NOTIFY_POWERSHELL = psPath;
+  return () => {
+    Object.defineProperty(process, 'platform', { value: realPlatform, configurable: true });
+    if (realPs === undefined) delete process.env.DSH_NOTIFY_POWERSHELL;
+    else process.env.DSH_NOTIFY_POWERSHELL = realPs;
+  };
+}
+
+const settle = () => new Promise((r) => setTimeout(r, 150));
+
+test('通知以 reminder 场景发出，带回跳 tag（持久停留）', async () => {
+  const fake = makeFakePowerShell();
+  const restore = pretendWindows(fake.psPath);
+  try {
+    const ctx = makeCtx();
+    applyHost(ctx, {});
+    ctx.sessions.add(session('s1'));
+    ctx.emit('session/event', ctx.sessions.get('s1'), turnEnd());
+    await settle();
+
+    const notifyScript = readScripts(fake.logPath).find((s) => s.includes('cmVtaW5kZXI=')); // b64('reminder')
+    assert.ok(notifyScript, '应发出 reminder 场景的通知');
+    assert.match(notifyScript, /bG9uZw==/, '应带 duration=long 兜底');
+    assert.match(notifyScript, /<actions>/, 'reminder 必须配按钮');
+    assert.match(notifyScript, /\$toast\.Tag/, '应打 tag 以便之后撤回');
+  } finally {
+    restore();
+    fake.cleanup();
+  }
+});
+
+test('用户回到 dsh 页面时按 tag 撤回持久通知', async () => {
+  const fake = makeFakePowerShell();
+  const restore = pretendWindows(fake.psPath);
+  try {
+    const ctx = makeCtx();
+    applyHost(ctx, {});
+    ctx.sessions.add(session('s1'));
+    ctx.emit('session/event', ctx.sessions.get('s1'), turnEnd());
+    await settle();
+    assert.ok(
+      readScripts(fake.logPath).some((s) => s.includes('cmVtaW5kZXI=')),
+      '前提：先得真的发出过通知',
+    );
+
+    await reportPresence(ctx, 's1', true, true);
+    await settle();
+
+    const dismissScript = readScripts(fake.logPath).find((s) => s.includes('History.Remove'));
+    assert.ok(dismissScript, '回到 dsh 后应撤回通知');
+    assert.match(dismissScript, /History\.Remove\(\$tag, \$group, \$appId\)/, '必须按 tag 精确撤回');
+  } finally {
+    restore();
+    fake.cleanup();
+  }
+});
+
+test('只是失焦可见（人在别的应用）不会撤回通知', async () => {
+  const fake = makeFakePowerShell();
+  const restore = pretendWindows(fake.psPath);
+  try {
+    const ctx = makeCtx();
+    applyHost(ctx, {});
+    ctx.sessions.add(session('s1'));
+    ctx.emit('session/event', ctx.sessions.get('s1'), turnEnd());
+    await settle();
+
+    await reportPresence(ctx, 's1', true, false);
+    await settle();
+
+    assert.ok(
+      !readScripts(fake.logPath).some((s) => s.includes('History.Remove')),
+      '通知还该留在屏幕上等人回来看',
+    );
+  } finally {
+    restore();
+    fake.cleanup();
+  }
+});
+
+test('dismissOnReturn=false 时不撤回', async () => {
+  const fake = makeFakePowerShell();
+  const restore = pretendWindows(fake.psPath);
+  try {
+    const ctx = makeCtx();
+    applyHost(ctx, { dismissOnReturn: false });
+    ctx.sessions.add(session('s1'));
+    ctx.emit('session/event', ctx.sessions.get('s1'), turnEnd());
+    await settle();
+
+    await reportPresence(ctx, 's1', true, true);
+    await settle();
+
+    assert.ok(!readScripts(fake.logPath).some((s) => s.includes('History.Remove')));
+  } finally {
+    restore();
+    fake.cleanup();
+  }
+});
+
+test('config 端点按 titleTag 配置回答浏览器半部', async () => {
+  const ctx = makeCtx();
+  applyHost(ctx, {});
+  const { status, body } = await callEndpoint(ctx, { op: 'config' });
+  assert.equal(status, 200);
+  assert.equal(body.titleTag, true, '默认应让浏览器打实例 tag');
+
+  const ctx2 = makeCtx();
+  applyHost(ctx2, { titleTag: false });
+  const second = await callEndpoint(ctx2, { op: 'config' });
+  assert.equal(second.body.titleTag, false);
 });
 
 test('presence sweep 定时器被注册为可清理 effect', () => {
   const ctx = makeCtx();
-  apply(ctx, {});
+  applyHost(ctx, {});
   assert.ok(ctx.effects.length >= 1, '应注册清理函数');
   assert.equal(typeof ctx.effects[0], 'function');
   ctx.effects[0]();
+});
+
+// ── 常驻焦点助手：加载时准备，卸载时收摊 ────────────────────────────────────
+//
+// 点击延迟从 ~2.1s 降到 ~0.15s 全靠这个助手常驻；这里只验证宿主的接线，助手本身
+// 的置前逻辑由 focus-lib.ps1 / focus-helper.ps1 承担（真机验证见 README）。
+
+test('加载时写助手配置，路径必须是 Windows 形式', () => {
+  const ctx = makeCtx();
+  applyHost(ctx);
+  const configPath = join(TEST_SPOOL, 'config.txt');
+  assert.ok(existsSync(configPath), '应写入 config.txt');
+  const text = readFileSync(configPath, 'utf8');
+  assert.match(text, /^marker=DeepSeek Harness$/m);
+  assert.match(text, /^tagmode=port$/m);
+  assert.match(text, /^helper=.*focus-helper\.ps1$/m);
+  assert.match(text, /^direct=.*focus-or-open\.ps1$/m, '回退脚本路径要写进去，助手不在时才有兜底');
+  assert.match(text, /^hidden=.*run-hidden\.vbs$/m);
+  assert.doesNotMatch(text, /^\w+=.*\/mnt\//m, '注册表那侧执行，不能出现 /mnt 形式');
+});
+
+test('titleTag=false 时 config 里的 tagmode 同步变成 off', () => {
+  const ctx = makeCtx();
+  applyHost(ctx, { titleTag: false });
+  assert.match(readFileSync(join(TEST_SPOOL, 'config.txt'), 'utf8'), /^tagmode=off$/m);
+});
+
+test('插件卸载时写 stop，让常驻助手退出', () => {
+  const ctx = makeCtx();
+  applyHost(ctx);
+  rmSync(join(TEST_SPOOL, 'stop'), { force: true });
+  ctx.dispose();
+  assert.ok(existsSync(join(TEST_SPOOL, 'stop')), 'dispose 应留下 stop 文件');
+});
+
+test('加载时会清掉上一次残留的 stop（否则新助手一起来就自杀）', () => {
+  writeFileSync(join(TEST_SPOOL, 'stop'), 'stale', 'utf8');
+  const ctx = makeCtx();
+  applyHost(ctx);
+  assert.ok(!existsSync(join(TEST_SPOOL, 'stop')), '陈旧的 stop 必须被清掉');
+});
+
+test('注册表命令指向 enqueue 脚本并带上 spool：点击路径上没有 PowerShell', async () => {
+  const fake = makeFakePowerShell();
+  const restore = pretendWindows(fake.psPath);
+  try {
+    const ctx = makeCtx();
+    applyHost(ctx);
+    await settle();
+    const registerScript = readScripts(fake.logPath).find((s) => s.includes('dshnotify'));
+    assert.ok(registerScript, '应发出注册脚本');
+    assert.match(registerScript, /enqueue-focus\.vbs/, '注册表应指向 enqueue 脚本');
+    assert.match(registerScript, /dshan-spool-/, '注册命令要带上 spool 目录');
+    assert.doesNotMatch(registerScript, /focus-or-open/, '不该把冷脚本塞进点击路径');
+    assert.doesNotMatch(registerScript, /focus-helper/, '助手路径走 config.txt，不进注册表');
+  } finally {
+    restore();
+    fake.cleanup();
+  }
+});
+
+test('启动助手时交给 wscript 的路径必须是 Windows 形式（否则会弹错误对话框）', () => {
+  // 真机踩到：wscript.exe 是 Windows 程序，把 `/mnt/d/...` 递过去会被当成未知
+  // 选项，并弹出「指定了未知的选项」对话框。路径必须转换，且加 //B 兜底。
+  const src = readFileSync(new URL('../lib/host.js', import.meta.url), 'utf8');
+  assert.match(
+    src,
+    /toWindowsPath\(LAUNCHER_VBS\),\s*toWindowsPath\(HELPER_PS1\)/,
+    '启动助手的 .vbs 与 .ps1 都要转成 Windows 路径',
+  );
+  assert.match(src, /'\/\/B'/, '//B 批处理模式：即使将来出错也只静默失败，不弹窗');
+  assert.doesNotMatch(src, /\bLAUNCHER_VBS,\s*HELPER_PS1\b/, '不得把 WSL 路径直接交给 wscript');
 });

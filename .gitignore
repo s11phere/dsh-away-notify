@@ -6,6 +6,9 @@ node_modules/
 *.log
 dsh-away-notify.log
 
+# 点击请求与常驻焦点助手的工作目录（运行期状态，不是源码）
+.focus-spool/
+
 # 本地缓存（协议注册、pnpm/npm 等）
 .npm-cache/
 .pnpm-store/

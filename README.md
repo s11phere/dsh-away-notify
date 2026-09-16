@@ -17,14 +17,22 @@
 ## 功能
 
 - **五类触发**（可分别开关）：回合完成、出错 / 中断 / 达到输出上限、等待审批、agent 提问、goal 完成
+- **一直停留**：通知用 Windows 的 `scenario="reminder"` 发出，**不会被系统几秒后收走**——
+  它待在屏幕上，直到你点它、或把 dsh 窗口切回前台（回到 dsh 时插件会主动撤回它）
 - **两级前台抑制**（见下方「在场判定」）：
   - 页面不可见（切到别的标签页）或窗口失焦（切到别的应用）→ **一律提醒**
   - 页面可见有焦点，且能确定你在看哪个会话 → 只抑制**那一个**会话，后台会话照常提醒
   - 页面可见有焦点，但拿不到会话 id → 保守抑制全部（这正是「不在 dsh 页面上才弹」）
 - **不做静音黑洞**：在场状态带 45 秒 TTL，标签页崩溃 / 浏览器被关掉后自动视为「离开」，不会永久静音
 - **点击回跳**：Toast 可点击，**优先聚焦已有的 dsh 浏览器窗口**（没有才新开），并**自动切到出事的那条会话**
-- **防刷屏**：同会话同类型通知有冷却时间；子代理会话默认不打扰；`/goal` 自动推进的中间轮次默认静默，只在目标完成 / 阻塞时提醒
-- **原生 Toast 细节**：正文标注会话标题与结果摘要，带系统提示音，通知留在 Windows 通知中心等你
+- **多实例也认得准**：同一台机器上并存 Windows 原生与 WSL 的 dsh 时，点击通知仍会聚焦到
+  **出事的那一个实例**的窗口，不会跑错（见下方「多个 dsh 实例并存」）
+- **点击即到**：点击后约 **0.2 秒**就把对应窗口提到前台（改前是 2.1 秒）。代价是多一个
+  常驻的小助手进程，原因见下方「点击延迟」
+- **防刷屏**：同会话同类型通知有冷却时间；同一件事反复触发是**替换**而不是叠加
+  （同 tag+group 的通知在 Windows 上是替换语义）；子代理会话默认不打扰；
+  `/goal` 自动推进的中间轮次默认静默，只在目标完成 / 阻塞时提醒
+- **原生 Toast 细节**：正文标注会话标题与结果摘要，带系统提示音，并带一个可点的操作按钮
 
 ### 点击回跳是怎么实现的
 
@@ -41,8 +49,11 @@ HKCU\Software\Classes\dshnotify\shell\open\command
   = "C:\Windows\System32\wscript.exe"
       "<插件目录>\scripts\run-hidden.vbs"
       "<插件目录>\scripts\focus-or-open.ps1"
-      "%1" "DeepSeek Harness"
+      "%1" "DeepSeek Harness" "port"
 ```
+
+最后一个参数是 `tagMode`（`port` / `off`），对应配置项 `titleTag`，见下方
+「多个 dsh 实例并存」。
 
 **为什么还要绕一层 wscript**：`ShellExecute` 启动 `powershell.exe` 时，即便传了
 `-WindowStyle Hidden`，**也会先闪一个控制台窗口**。`wscript.exe` 是 GUI 子系统宿主、
@@ -56,15 +67,93 @@ Toast 的点击目标随之变成 `dshnotify:<base64url(URL)>`（base64 是为�
 
 1. 枚举 msedge / chrome / firefox 的顶层窗口，取标题里含 `DeepSeek Harness` 的那个
    （窗口标题即当前标签页标题，实测确实包含应用名）
-2. 找到 → 若最小化先还原，再用 `SetForegroundWindow`（带 `AttachThreadInput`
+2. **再要求标题里含本实例的端口 tag** `[dsh:<port>]`（端口从点击 URL 里解出），
+   于是只命中出事的那一个实例；命中不了就跳过，走第 3 步
+3. 找到 → 若最小化先还原，再用 `SetForegroundWindow`（带 `AttachThreadInput`
    绕过前台锁）提到前台
-3. 找不到 → 用默认浏览器打开目标 URL
+4. 找不到 → 用默认浏览器打开目标 URL（URL 本身带端口，落点仍然正确，只是可能多一个标签页）
 
 想关掉这个行为：配置 `useProtocolHandler: false`；想彻底清除注册表项，删除
 `HKCU\Software\Classes\dshnotify` 即可。
 
 > 依赖 Windows Script Host（`wscript.exe`）。极少数用组策略禁用 WSH 的机器上协议会
 > 失效，此时把 `useProtocolHandler` 设为 `false` 即退回普通 URL 行为。
+
+#### 多个 dsh 实例并存（Windows 原生 + WSL）
+
+同一台机器上同时跑 Windows 原生和 WSL 的 dsh 时，**两边浏览器窗口的标题是完全一样的**——
+dsh 的前端把产品名硬编码成 `DeepSeek Harness`（`dsh-client-ui-layout`），标题格式是
+`<会话标题> — DeepSeek Harness`。只按 marker 匹配必然认错窗口，于是点击 WSL 的通知
+可能把 Windows 那个窗口提到前台。
+
+解决办法是给标题加一个**按端口区分**的后缀：
+
+- 浏览器半部（`lib/client.js`）用 `location.port` 把 `document.title` 变成
+  `… — DeepSeek Harness [dsh:3081]`。标题归 `dsh-client-ui-layout` 所有、会话切换时
+  会被整体重写，所以客户端用 `MutationObserver` 在每次被覆盖后补回（补写是幂等的，
+  不会打转）。
+- 聚焦脚本从**点击 URL 的端口**重建同一个 tag，要求窗口标题同时含 marker 和 tag。
+  用端口而不是额外传参，是因为它同时出现在地址栏和通知 URL 上，两边无需额外通信
+  就能推导出同一个值。
+
+由此带来两点：
+
+- **一个协议键就够**。tag 是脚本从 URL 现推的，不写进注册表，所以 Windows 与 WSL
+  两边注册同一条 `dshnotify:` 命令也互不干扰（后加载的覆盖先加载的，而内容等价）。
+- **两个实例的通知仍共用同一个 `appId`**（默认都是 `DeepSeek Harness`），因此在通知
+  中心里外观一致、静音设置也共享。这是刻意的：点击能回到正确的窗口之后，就不需要
+  再靠 `appId` / `titlePrefix` 去区分来源了。若你仍想分别静音，给其中一个 profile
+  单独设 `appId` 即可。
+
+回退开关：`titleTag: false` 会让浏览器不再打后缀、协议命令里的 `tagMode` 变成 `off`，
+退回「只按 marker 匹配」的旧行为（多实例时会认错窗口）。
+
+#### 点击延迟：为什么要有一个常驻助手进程
+
+最初的实现里，注册表直接指向 `focus-or-open.ps1`。这在真机上实测要 **2.1 秒**才把窗口
+提到前台，拆开看（Windows 侧实测，取多次最优）：
+
+| 环节 | 耗时 | 说明 |
+|---|---|---|
+| `wscript.exe` 启动 | 6ms | 可以忽略 |
+| **`powershell.exe` 进程启动** | **~950ms** | 元凶；每次点击都要重付一遍 |
+| `Add-Type` 现场编译 P/Invoke | 285ms | 每次点击都要重新编译 C# |
+| `Get-Process` 枚举（冷） | ~213ms | 热了只要 7ms，但每次都是新进程 |
+| 窗口置前 | ~10ms | |
+
+**结论：不换掉「每次点击起一个 PowerShell」这个结构，延迟就降不下来**——冷启动是硬成本，
+不是脚本写得不够快。所以改成：
+
+```
+点击
+ └─ wscript.exe  enqueue-focus.vbs "%1" "<spool>"      ← 只写一个请求文件就退出
+      └─ spool/req-*.txt
+           └─ focus-helper.ps1（常驻，FileSystemWatcher 唤醒）← 真正置前
+```
+
+`focus-helper.ps1` 在插件加载时起一次，把那三笔一次性成本付掉并一直待命；点击时只剩
+「VBS 写文件 + 事件唤醒 + 置前」。用 `FileSystemWatcher` 而不是轮询，是因为轮询要做到
+同等响应速度得每 50ms 醒一次（白烧 10-25% 的一个核），而事件驱动待机几乎不耗 CPU。
+
+实测结果（同一台机器、同一段代码、各 6 次）：
+
+| | 改前 | 改后 |
+|---|---|---|
+| 稳态点击延迟 | 2100-2230ms | **172-245ms** |
+| 助手被杀后的下一次点击 | — | 2450ms（自愈，之后恢复 ~200ms） |
+
+`focus-lib.ps1` 是两条路径共用的逻辑库：`focus-helper.ps1`（快路径）和
+`focus-or-open.ps1`（回退）都 dot-source 它，所以匹配规则不会各写一份而漂移。
+
+自愈与兜底：
+
+- enqueue 脚本用 `spool/heartbeat` 的新鲜度判断助手死活；不新鲜就顺手拉起它。
+- 拉起的是冷助手，所以要等它启动；等不到（或助手彻底起不来）就直接冷跑
+  `focus-or-open.ps1`。**点击永远不会静默失败**，最坏情况只是退化成改前的 ~2 秒。
+- 助手用命名互斥量保证单实例；插件卸载时写 `spool/stop` 让它退出。
+
+> 不想要常驻进程：`useProtocolHandler: false` 会退回「点击直接开 URL」（无脚本，最快，
+> 但可能多一个重复标签页）。
 
 #### 2. 打开正确会话 —— 宿主记住 + 客户端索取
 
@@ -185,8 +274,12 @@ node scripts/selftest-notify.mjs "标题" "正文"
     previewMaxChars: 140       # 正文摘要截断长度
     sound: true                # 系统提示音
     openOnClick: true          # Toast 可点击回跳
+    persistent: true           # 通知一直停留，直到点它或切回 dsh
+    dismissOnReturn: true      # 回到 dsh 页面时撤回还挂着的通知
     includeToken: true         # URL 带鉴权 token（见下方安全说明）
     useProtocolHandler: true   # 注册 dshnotify: 协议，点击优先聚焦已有窗口
+    titleTag: true             # 给标题加 [dsh:<port>]，多实例时精确聚焦对应窗口
+    spoolDir: ''               # 点击请求与焦点助手的工作目录；留空 = <插件目录>/.focus-spool
     focusWindowMarker: 'DeepSeek Harness'  # 用窗口标题里的这个串识别 dsh 窗口
     focusTtlMs: 90000          # 「待跳转会话」有效期
     titlePrefix: 'DSH'
@@ -196,6 +289,8 @@ node scripts/selftest-notify.mjs "标题" "正文"
     debug: false               # 写文件日志
     notifyOnLoad: false        # 加载时发自检通知
 ```
+
+> `appName` 目前**没有接线**（声明了但无处读取），改它不会有效果；要区分通知来源请改 `appId`。
 
 ---
 
@@ -234,11 +329,18 @@ dsh 的 Web UI 在端口上要求鉴权（裸访问返回 `401 dsh web authentic
 
 | 文件 | 职责 |
 |---|---|
-| `lib/host.js` | 宿主插件：事件订阅、状态累计、决策接线、URL 生成、presence 端点 |
-| `lib/client.js` | 浏览器半部：在场上报 + 点击回跳切会话 |
+| `lib/host.js` | 宿主插件：事件订阅、状态累计、决策接线、URL 生成、presence 端点、拉起焦点助手 |
+| `lib/client.js` | 浏览器半部：在场上报 + 点击回跳切会话 + 实例标题 tag |
 | `lib/policy.js` | 纯逻辑：五类触发判定、前台抑制、冷却去重、goal 轮次静默 |
 | `lib/presence.js` | 纯逻辑：会话级在场状态表 + TTL |
-| `lib/notifier.js` | 通知投递：三态平台探测 + WinRT Toast / notify-send |
+| `lib/notifier.js` | 通知投递：三态平台探测 + WinRT Toast（持久化 / 撤回）/ notify-send |
+| `lib/protocol.js` | `dshnotify:` 协议：URI 编解码、注册表命令组装（enqueue / direct 两态） |
+| `scripts/enqueue-focus.vbs` | 点击入口：只写请求文件，顺带保证助手活着（快路径） |
+| `scripts/focus-helper.ps1` | 常驻助手：FileSystemWatcher 唤醒后置前（快路径的执行者） |
+| `scripts/focus-lib.ps1` | 共享逻辑：窗口匹配（marker + 端口 tag）、置前、兜底开 URL |
+| `scripts/focus-or-open.ps1` | 一次性处理器：助手不可用时的冷回退，也可手工调试 |
+| `scripts/run-hidden.vbs` | 无窗口闪烁启动 PowerShell（助手启动与冷回退共用） |
+| `scripts/selftest-notify.mjs` | 脱离 dsh 单独验证通知通道并回读通知中心 |
 
 `policy.js` / `presence.js` / `notifier.js` 都不依赖 DSH 运行时，因此可以脱离 dsh 单测：
 
@@ -266,18 +368,25 @@ node --test
 
 7. **客户端 bundle 不能 require 非 seed 内部包**。`@deepseek-ai/dsh-client-ui-slots` 这类是前端 shell 的 seed 静态模块（不是 npm 包），而 `dsh-client-runtime` 已彻底退役。本插件的客户端半部不 require 任何模块。
 
+8. **交给 Windows 程序的路径一律要转换，不只是注册表那一条**。从 WSL 里 `spawn` 一个 Windows exe 时，**参数里的路径**同样是 Windows 程序在读：把 `/mnt/d/...` 递给 `wscript.exe` 会被当成未知选项，并**弹出模态错误对话框**（真机踩到：dsh 启动时弹「指定了未知的选项"…/run-hidden.vbs"」）。所以启动焦点助手时 `.vbs` 与 `.ps1` 都经 `toWindowsPath`，并加 `//B` 批处理模式——即使将来还有别的错误，也只静默失败，不会弹窗打扰。可执行文件本身仍用 WSL 路径（那是 WSL 侧 `spawn` 用的）。
+
 ---
 
 ## 已知限制
 
 - **前端不支持 `?session=` 深链**，而且鉴权的 token 换取会 `303` 丢掉查询参数（见上文「点击回跳是怎么实现的」）。所以会话跳转是**由本插件的客户端半部**调 `sessions.open()` 完成的，这也是为什么这个插件必须带客户端半部。
 - 跳转的**待跳转会话有 90 秒有效期**（`focusTtlMs`）：超过这个时间再点旧通知，就只回到 dsh 页面、不再强行切会话。
-- **聚焦靠窗口标题识别**：脚本用窗口标题里的 `focusWindowMarker`（默认 `DeepSeek Harness`）判断哪个浏览器窗口有 dsh。若 dsh 标签页退到别的标签后面，窗口标题会变成那个标签的标题，可能识别不到 → 退化为打开新标签页。可调 `focusWindowMarker`，或让 dsh 标签页保持在前台。
+- **窗口标题里必须有 dsh 标签页的标题**：脚本靠窗口标题识别。若 dsh 标签页退到别的标签后面，窗口标题会变成那个前台标签的标题，marker 和端口 tag 都匹配不上 → 退化为打开新标签页（落点仍正确）。可让 dsh 标签页保持在前台。
 - 聚焦是**窗口级**的：脚本能把浏览器窗口提到前台，但没有浏览器调试协议（CDP）就无法精确切到某个**标签页**。若 dsh 标签页在该窗口里不是当前标签，提到前台后可能仍需手动切一下；不过它一旦获得焦点，插件也会自动把它切到目标会话。
 - 同一条通知被点开后，**新标签页会先落回上次选中的会话、约 1 秒后才切到目标会话**（因为 URL 参数在鉴权重定向时被丢弃，只能由页面加载后主动索取）。实测日志可见这一跳转。
-- 普通 Linux 桌面依赖 `notify-send`（多数发行版需自行安装 `libnotify-bin`）；WSL 下不需要，直接走 Windows Toast。
+- **持久通知依赖 `scenario="reminder"` + 一个按钮**：Windows 会忽略没有按钮的 reminder 场景（退化成普通通知，几秒后收走）。插件因此在持久化时总会带上按钮。另外 `reminder` 通知不会被 Focus Assist / 勿扰静默掉，这是系统行为。
+- **`titleTag` 会改写标签页标题**：这是多实例精确聚焦的代价（`… — DeepSeek Harness [dsh:3081]`）。不喜欢可以设 `titleTag: false`，代价是多个实例并存时会认错窗口。
+- **焦点助手是个常驻 PowerShell 进程**（约 50-70MB），这是把点击从 2.1s 降到 0.2s 的代价，见「点击延迟」。它用命名互斥量保证单实例，插件卸载时会收到 `stop` 并退出。若它意外死亡，下一次点击会把它拉起来（这一次约 2.4s），之后恢复 ~0.2s。
+- **助手重载期间可能有一次慢点击**：插件 HMR 重载时旧助手收到 `stop` 退出、新助手可能因互斥量抢先失败而退出，于是下一次点击要等心跳过期后重新拉起。只影响一次。
+- 普通 Linux 桌面依赖 `notify-send`（多数发行版需自行安装 `libnotify-bin`）；WSL 下不需要，直接走 Windows Toast。Linux 上持久化用 `notify-send -u critical -t 0` 近似，但**撤回通知没有通用通道**，`dismissOnReturn` 在 Linux 上不生效。
 - presence 端点的注册清理绑定在 connection 服务的 fiber 上（框架语义），HMR 重载插件时端点可能不会随之注销，但重复注册是覆盖语义，不会报错。
 - 多标签页同时打开时，每个标签页都会独立上报（这是设计如此，多标签都能各自被抑制），因此切换标签页时日志会有较多上报记录。
+- **测试有两处真实副作用，都已用替身挡住**：在 WSL 下 `detectPlatform()` 判为 wsl，宿主测试原本会真的弹通知，也会真的写 `HKCU\Software\Classes\dshnotify`。现在统一把 `DSH_NOTIFY_POWERSHELL` 指向静默替身，并把 `spoolDir` 指到临时目录；新增会触发通知或注册协议的用例时请沿用这两个约定。
 
 ---
 

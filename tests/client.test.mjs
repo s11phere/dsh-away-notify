@@ -9,19 +9,38 @@ const PRESENCE_PATH = '/api/dsh-away-notify';
 const FOCUS_PARAM = 'dshAwayNotifyFocus';
 
 /** 建立最小 DOM 桩并加载 client.js，返回其导出。 */
-async function loadClientModule({ search = '', pendingFocusReply = null } = {}) {
+async function loadClientModule({ search = '', pendingFocusReply = null, titleTagReply } = {}) {
   const listeners = [];
   const registrations = [];
+  const observerInstances = [];
 
   const documentStub = {
     visibilityState: 'visible',
     hasFocus: () => true,
+    title: '我的会话 — DeepSeek Harness',
+    head: {},
     addEventListener: (type, handler) => listeners.push(['document', type, handler]),
     removeEventListener: (type, handler) => {
       const i = listeners.findIndex(([t, ty, h]) => t === 'document' && ty === type && h === handler);
       if (i >= 0) listeners.splice(i, 1);
     },
   };
+
+  /** 可手动触发的 MutationObserver 替身：Node 里没有 DOM 的这一个。 */
+  class FakeMutationObserver {
+    constructor(callback) {
+      this.callback = callback;
+      this.disconnected = false;
+      observerInstances.push(this);
+    }
+    observe() {}
+    disconnect() {
+      this.disconnected = true;
+    }
+    trigger() {
+      this.callback();
+    }
+  }
 
   const windowStub = {
     __ModuleLoader__: {
@@ -41,10 +60,12 @@ async function loadClientModule({ search = '', pendingFocusReply = null } = {}) 
     location: globalThis.location,
     history: globalThis.history,
     fetch: globalThis.fetch,
+    MutationObserver: globalThis.MutationObserver,
   };
 
   globalThis.window = windowStub;
   globalThis.document = documentStub;
+  globalThis.MutationObserver = FakeMutationObserver;
   globalThis.fetch = (url, init) => {
     fetchCalls.push({ url, init });
     let reqBody = {};
@@ -53,13 +74,19 @@ async function loadClientModule({ search = '', pendingFocusReply = null } = {}) 
     } catch {
       /* ignore */
     }
-    // 宿主的 pending-focus 应答由测试用 pendingFocusReply 控制
-    const payload = reqBody.op === 'pending-focus' ? { ok: true, sessionId: pendingFocusReply } : { ok: true };
+    // 宿主的 pending-focus / config 应答由测试控制
+    let payload = { ok: true };
+    if (reqBody.op === 'pending-focus') payload = { ok: true, sessionId: pendingFocusReply };
+    else if (reqBody.op === 'config' && titleTagReply !== undefined) {
+      payload = { ok: true, titleTag: titleTagReply };
+    }
     return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(payload) });
   };
   globalThis.location = {
     search,
     href: `http://127.0.0.1:3081/${search}`,
+    port: '3081',
+    protocol: 'http:',
   };
   globalThis.history = { state: null, replaceState: () => {} };
 
@@ -80,12 +107,19 @@ async function loadClientModule({ search = '', pendingFocusReply = null } = {}) 
     fetchCalls,
     documentStub,
     windowStub,
+    observerInstances,
+    /** 模拟 dsh-client-ui-layout 重写 document.title，然后触发观察者。 */
+    overwriteTitle: (next) => {
+      documentStub.title = next;
+      for (const o of observerInstances) if (!o.disconnected) o.trigger();
+    },
     restore: () => {
       globalThis.window = replaced.window;
       globalThis.document = replaced.document;
       globalThis.location = replaced.location;
       globalThis.history = replaced.history;
       globalThis.fetch = replaced.fetch;
+      globalThis.MutationObserver = replaced.MutationObserver;
     },
   };
 }
@@ -173,7 +207,9 @@ test('apply 内部按需注入 sessions', async () => {
 test('apply 后立即上报一次 presence 到正确端点', async () => {
   const { mod } = await boot();
   assert.ok(mod.fetchCalls.length >= 1, '应至少上报一次');
-  const call = mod.fetchCalls[0];
+  // 启动时还会先发一次 config（问宿主标题 tag 开关），所以按 op 定位而不是取第一条
+  const call = mod.fetchCalls.find((c) => JSON.parse(c.init.body).op === 'presence');
+  assert.ok(call, '应至少上报一次 presence');
   assert.equal(call.url, PRESENCE_PATH);
   assert.equal(call.init.method, 'POST');
   const body = JSON.parse(call.init.body);
@@ -352,4 +388,51 @@ test('上报失败（fetch reject）不会抛出未处理异常', async () => {
   assert.doesNotThrow(() => mod.clientModule.apply(ctx));
   await new Promise((r) => setTimeout(r, 20));
   ctx.dispose();
+});
+
+// ── 实例标题 tag（多实例窗口区分）────────────────────────────────────────────
+
+test('启动即给标题追加本实例端口 tag', async () => {
+  const { mod } = await boot();
+  assert.equal(mod.documentStub.title, '我的会话 — DeepSeek Harness [dsh:3081]');
+});
+
+test('标题被布局插件重写后自动补回 tag（且不会重复叠加）', async () => {
+  const { mod } = await boot();
+  assert.ok(mod.observerInstances.length > 0, '应挂上 MutationObserver');
+
+  mod.overwriteTitle('另一个会话 — DeepSeek Harness');
+  assert.equal(mod.documentStub.title, '另一个会话 — DeepSeek Harness [dsh:3081]');
+
+  // 再触发一次：已经带 tag，不应叠加成两个
+  mod.overwriteTitle('另一个会话 — DeepSeek Harness [dsh:3081]');
+  assert.equal(mod.documentStub.title, '另一个会话 — DeepSeek Harness [dsh:3081]');
+});
+
+test('宿主配置 titleTag=false 时撤下 tag 并断开观察者', async () => {
+  const { mod } = await boot({ titleTagReply: false });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(mod.documentStub.title, '我的会话 — DeepSeek Harness', '应还原成原始标题');
+  assert.ok(
+    mod.observerInstances.every((o) => o.disconnected),
+    '应断开观察者，避免继续改写标题',
+  );
+});
+
+test('config 请求失败时保持 tag 开着（与宿主脚本默认一致）', async () => {
+  const mod = await loadClientModule();
+  loaded.push({ mod });
+  globalThis.fetch = () => Promise.reject(new Error('network down'));
+  const ctx = makeClientCtx();
+  mod.clientModule.apply(ctx);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(mod.documentStub.title, '我的会话 — DeepSeek Harness [dsh:3081]');
+  ctx.dispose();
+});
+
+test('dispose 时撤下 tag', async () => {
+  const { mod, ctx } = await boot();
+  assert.equal(mod.documentStub.title, '我的会话 — DeepSeek Harness [dsh:3081]');
+  ctx.dispose();
+  assert.equal(mod.documentStub.title, '我的会话 — DeepSeek Harness');
 });
