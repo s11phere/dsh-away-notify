@@ -229,6 +229,28 @@ test('focus-lib.ps1 用字面包含而非 -like（否则[]会被当成字符集�
   assert.doesNotMatch(src, /-like\s+"\*\$(tag|Marker)\*"/, '标题匹配不得再用 -like 包住变量');
 });
 
+test('focus-lib.ps1 用一次 EnumWindows 找窗口，不再逐个进程全量枚举', () => {
+  const src = readScript('focus-lib.ps1');
+  // 真机实测：GetProcessesByName 单次就要枚举整台机器的进程（400 进程时 148-213ms），
+  // 而旧实现每次点击调它三次（msedge/chrome/firefox），成了点击延迟的大头。
+  assert.match(src, /EnumWindows/, '应按顶层窗口枚举');
+  assert.match(src, /ListWindowTitles/, '应走一次枚举拿到所有标题');
+  assert.doesNotMatch(
+    src,
+    /\[System\.Diagnostics\.Process\]::GetProcessesByName/,
+    '不该再用全量扫进程的 GetProcessesByName（注释里提到它不算）',
+  );
+});
+
+test('focus-lib.ps1 记住上次命中的窗口：标签不在前台时不新开标签页', () => {
+  const src = readScript('focus-lib.ps1');
+  // 窗口标题只反映浏览器当前标签：用户切到别的标签后 marker/tag 就消失，旧实现会
+  // 因此新开一个重复标签页。多实例并存时本实例的标签必然经常不在前台，更需要兜底。
+  assert.match(src, /DshWindowCache/, '应缓存上次命中的窗口');
+  assert.match(src, /IsWindow\(\$cached\)/, '缓存命中前要用 IsWindow 确认窗口还在');
+  assert.match(src, /FromCache/, '应把「来自缓存」透出来，便于诊断');
+});
+
 test('focus-or-open.ps1 与 focus-helper.ps1 共用同一份逻辑，不各写一遍', () => {
   for (const name of ['focus-or-open.ps1', 'focus-helper.ps1']) {
     const src = readScript(name);

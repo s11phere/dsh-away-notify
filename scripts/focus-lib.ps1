@@ -5,9 +5,10 @@
 #   * focus-helper.ps1  - resident helper started at plugin load; the fast path
 #
 # A one-shot PowerShell costs ~2s per click: process start (~950ms) + Add-Type
-# compiling the P/Invoke block (~285ms) + cold assembly loads. Resident, the
-# helper pays all of that once. Measured breakdown lives in the README section
-# on click latency.
+# compiling the P/Invoke block (~285ms) + window lookup. Resident, the helper pays
+# the first two once. The window lookup itself used to dominate what was left
+# (Process.GetProcessesByName x3 = 0.45-0.65s); it is now a single EnumWindows pass
+# (single-digit ms). Measured breakdown lives in the README section on click latency.
 #
 # THIS FILE MUST STAY PURE ASCII: Windows PowerShell 5.1 reads a .ps1 without a
 # BOM using the ANSI code page, and any non-ASCII character makes it fail to
@@ -38,6 +39,36 @@ if (-not ([System.Management.Automation.PSTypeName]'DshNotify.Native').Type) {
 [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
 [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
 [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+[DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+[DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextLength(IntPtr hWnd);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
+public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+// One EnumWindows pass, "hwnd<TAB>pid<TAB>title" per visible titled window.
+//
+// Why not Process.GetProcessesByName: a single call already enumerates *every*
+// process (148-213ms measured on a 400-process machine) and the old code called it
+// three times per click (msedge/chrome/firefox). EnumWindows walks only top-level
+// windows and costs single-digit ms, so the click path stops paying for a process
+// sweep. Matching stays by window title (see Test-TitleContains).
+public static string[] ListWindowTitles() {
+  System.Collections.Generic.List<string> list = new System.Collections.Generic.List<string>();
+  EnumWindows(delegate(IntPtr hWnd, IntPtr lParam) {
+    if (!IsWindowVisible(hWnd)) { return true; }
+    int len = GetWindowTextLength(hWnd);
+    if (len <= 0) { return true; }
+    System.Text.StringBuilder sb = new System.Text.StringBuilder(len + 1);
+    GetWindowText(hWnd, sb, sb.Capacity);
+    string title = sb.ToString();
+    if (title.Length == 0) { return true; }
+    uint pid = 0;
+    GetWindowThreadProcessId(hWnd, out pid);
+    list.Add(hWnd.ToInt64().ToString() + "\t" + pid.ToString() + "\t" + title);
+    return true;
+  }, IntPtr.Zero);
+  return list.ToArray();
+}
 '@
 }
 
@@ -91,23 +122,51 @@ function Get-DshInstanceTag {
   return ''
 }
 
-# Enumerate the three Chromium/Firefox families and pick the window whose title
-# holds both the marker and (when tag mode is on) this instance's port tag.
+# Last window we matched, keyed by "marker|tag".
+#
+# The OS window title only reflects the browser's *active* tab, so as soon as the
+# user switches to another tab the marker and the instance tag vanish from the
+# title and matching fails - which used to mean a duplicate tab got opened. Keeping
+# the last match lets a later click still bring the right window forward. This
+# matters most with several dsh instances: only one of their tabs can be active, so
+# for the others title matching always fails.
+if ($null -eq $script:DshWindowCache) { $script:DshWindowCache = @{} }
+
+# Pick the window whose title holds both the marker and (when tag mode is on) this
+# instance's port tag. Titles come from one EnumWindows pass; matching is literal
+# (see Test-TitleContains). Returns the handle, not a Process object, so nothing
+# here has to enumerate processes.
 function Find-DshWindow {
   param([string]$Marker, [string]$Tag)
-  $candidates = @()
-  foreach ($procName in @('msedge', 'chrome', 'firefox')) {
-    $candidates += [System.Diagnostics.Process]::GetProcessesByName($procName)
+  $byMarker = @()
+  foreach ($line in [DshNotify.Native]::ListWindowTitles()) {
+    # Split into hwnd / pid / title with a limit so tabs inside a title survive.
+    $parts = $line.Split([char]9, 3)
+    if ($parts.Length -lt 3) { continue }
+    $title = $parts[2]
+    if (Test-TitleContains $title $Marker) {
+      $byMarker += [pscustomobject]@{ Handle = [IntPtr]([long]$parts[0]); Pid = [int]$parts[1]; Title = $title }
+    }
   }
-  $windows = @($candidates | Where-Object { $null -ne $_ -and $_.MainWindowHandle -ne 0 })
-  $byMarker = @($windows | Where-Object { Test-TitleContains $_.MainWindowTitle $Marker })
   $target = $null
   if ([string]::IsNullOrEmpty($Tag)) {
     $target = $byMarker | Select-Object -First 1
   } else {
-    $target = $byMarker | Where-Object { Test-TitleContains $_.MainWindowTitle $Tag } | Select-Object -First 1
+    $target = $byMarker | Where-Object { Test-TitleContains $_.Title $Tag } | Select-Object -First 1
   }
-  return [pscustomobject]@{ Target = $target; MarkerCount = $byMarker.Count }
+  $key = $Marker + '|' + $Tag
+  if ($null -ne $target) {
+    $script:DshWindowCache[$key] = $target.Handle
+    return [pscustomobject]@{ Target = $target; MarkerCount = $byMarker.Count; FromCache = $false }
+  }
+  # Title miss: the dsh tab is most likely just not the active one anymore, so fall
+  # back to the window we matched last time instead of opening a duplicate tab.
+  $cached = $script:DshWindowCache[$key]
+  if ($null -ne $cached -and [DshNotify.Native]::IsWindow($cached)) {
+    $fallback = [pscustomobject]@{ Handle = $cached; Pid = 0; Title = '(last matched window)' }
+    return [pscustomobject]@{ Target = $fallback; MarkerCount = $byMarker.Count; FromCache = $true }
+  }
+  return [pscustomobject]@{ Target = $null; MarkerCount = $byMarker.Count; FromCache = $false }
 }
 
 # The whole handler. Returns a single ASCII status line (the helper records it
@@ -125,8 +184,10 @@ function Invoke-DshFocus {
 
     $found = Find-DshWindow -Marker $Marker -Tag $tag
     if ($null -ne $found.Target) {
-      $ok = Focus-DshWindow -Handle $found.Target.MainWindowHandle
-      return 'FOCUSED hwnd=' + $found.Target.MainWindowHandle + ' ok=' + $ok + ' tag=' + $tag
+      $ok = Focus-DshWindow -Handle $found.Target.Handle
+      $via = ''
+      if ($found.FromCache) { $via = ' CACHED' }
+      return 'FOCUSED hwnd=' + $found.Target.Handle + ' ok=' + $ok + ' tag=' + $tag + $via
     }
 
     # Distinguish "the marker matched nothing" from "it matched, but not this

@@ -456,6 +456,44 @@ test('只是失焦可见（人在别的应用）不会撤回通知', async () =>
   }
 });
 
+test('别的会话在前台（含心跳）不会撤掉本会话的通知', async () => {
+  const fake = makeFakePowerShell();
+  const restore = pretendWindows(fake.psPath);
+  try {
+    const ctx = makeCtx();
+    applyHost(ctx, {});
+    ctx.sessions.add(session('s1'));
+    ctx.sessions.add(session('s2'));
+    ctx.emit('session/event', ctx.sessions.get('s1'), turnEnd());
+    await settle();
+    assert.ok(
+      readScripts(fake.logPath).some((s) => s.includes('cmVtaW5kZXI=')),
+      '前提：s1 的通知已发出',
+    );
+
+    // 用户切到 s2 并保持焦点。客户端每 ~15s 会重复上报同样的 visible+focused，
+    // 这里连发两次模拟心跳：都不该把 s1 还挂着的通知撤掉。
+    await reportPresence(ctx, 's2', true, true);
+    await reportPresence(ctx, 's2', true, true);
+    await settle();
+    assert.ok(
+      !readScripts(fake.logPath).some((s) => s.includes('History.Remove')),
+      '人在 s2 时不该撤回 s1 的通知（否则后台会话的提醒会被心跳静默撤掉）',
+    );
+
+    // 真的切回 s1 才撤
+    await reportPresence(ctx, 's1', true, true);
+    await settle();
+    assert.ok(
+      readScripts(fake.logPath).some((s) => s.includes('History.Remove')),
+      '看到 s1 后应撤回它的通知',
+    );
+  } finally {
+    restore();
+    fake.cleanup();
+  }
+});
+
 test('dismissOnReturn=false 时不撤回', async () => {
   const fake = makeFakePowerShell();
   const restore = pretendWindows(fake.psPath);
