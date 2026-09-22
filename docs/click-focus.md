@@ -199,10 +199,11 @@ Local\dsh-away-notify-focus-helper-<SHA1(小写、去掉尾部分隔符的 spool
 1. 发通知时宿主记下 `pendingFocus = { sessionId, at }`（默认有效期 90 秒，`focusTtlMs`）；
 2. 浏览器半部在**页面加载时**、以及**每次重新获得焦点 / 页面可见时**，调用
    `POST /api/dsh-away-notify {op:'pending-focus'}` 索取目标会话；
-3. 拿到就 `sessions.open(sessionId)`，然后 `{op:'ack-focus'}` 回执清除。
+3. 拿到就切会话（dsh 0.1.6 调 `sessions.open(sessionId)`，0.1.7 起改调
+   `uiWorkspace.openSession(sessionId)`），然后 `{op:'ack-focus'}` 回执清除。
 
 因为第 2 步包含「重新获得焦点」，所以即使浏览器只是把已有窗口提到前台、并没有重新加载页面，
 那个页面也会自己切到目标会话。URL 上仍保留 `?dshAwayNotifyFocus=…` 作为兼容路径，但当前鉴权
 流程下通常到不了前端。
 
-> 这也是为什么这个插件**必须带客户端半部**：会话跳转最终是由页面里的 `sessions.open()` 完成的。
+> 这也是为什么这个插件**必须带客户端半部**：会话跳转最终是由页面里的会话切换 API 完成的。

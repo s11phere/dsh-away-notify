@@ -206,6 +206,7 @@ dsh 的 Web UI 在端口上要求鉴权（裸访问返回 `401 dsh web authentic
 | 点了通知没回到 dsh | 看 `.focus-spool\last-status.txt`：`FOCUSED` / `TAB_FOCUSED` 说明脚本执行了；`TAG_MISS` 说明标题里没有本实例的 tag（检查 `titleTag`、以及页面是否已刷新）；`NO_WINDOW` 说明连 marker 都没匹配到 |
 | 点击要等一两秒 | 助手进程不在了。看 `.focus-spool\heartbeat` 的 mtime 是不是一秒一跳，见 [docs/windows.md](docs/windows.md#2-升级提醒可能残留一个旧版焦点助手进程) |
 | 通知几秒就消失 | 只有 `persistent: true` 才会用 `scenario="reminder"` + 按钮常驻；另外 reminder 场景**必须带按钮**，否则 Windows 会退化成普通通知 |
+| 回到 dsh 后提醒还赖着不走 | 控制台 `op:'state'` 看 `sessionTracking`。为 `false` 说明客户端拿不到会话 id，按会话撤回（`dismissOnReturn`）不生效。旧 bundle 跑在新 dsh 上会这样：更新插件后**刷新页面** |
 | 页面控制台查到 `mode: away` | 你开着 DevTools，页面失焦了——预期行为 |
 
 ---
@@ -216,7 +217,7 @@ dsh 的 Web UI 在端口上要求鉴权（裸访问返回 `401 dsh web authentic
 |---|---|
 | [docs/windows.md](docs/windows.md) | **Windows 安装避坑**（跨盘符会装坏）、升级提醒、通知通道自检、纯 ASCII 约束、多实例共存 |
 | [docs/click-focus.md](docs/click-focus.md) | 点击回跳原理：`dshnotify:` 协议、常驻助手、UI Automation 选标签、点击延迟账、会话跳转 |
-| [docs/implementation-notes.md](docs/implementation-notes.md) | 架构图、模块划分、在场判定机制、针对 dsh `0.1.6-alpha.1` 的实现要点、测试约定 |
+| [docs/implementation-notes.md](docs/implementation-notes.md) | 架构图、模块划分、在场判定机制、针对 dsh `0.1.6` / `0.1.7` 的实现要点、测试约定 |
 | [docs/known-limitations.md](docs/known-limitations.md) | 完整的已知限制（会话跳转 / 聚焦 / 通知 / 进程资源 / 框架行为） |
 | [docs/verification-windows.md](docs/verification-windows.md) | Windows 原生端到端验证记录：环境、覆盖矩阵、真实日志证据、两个 Windows 独有缺陷 |
 

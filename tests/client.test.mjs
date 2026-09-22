@@ -124,24 +124,33 @@ async function loadClientModule({ search = '', pendingFocusReply = null, titleTa
   };
 }
 
-function makeClientCtx({ current = 's1', byId = { s1: {}, s2: {} }, phase = 'ready' } = {}) {
+function makeClientCtx({
+  current = 's1',
+  byId = { s1: {}, s2: {} },
+  phase = 'ready',
+  sessionsOpen = true,
+  withWorkspace = false,
+} = {}) {
   const opened = [];
+  const openedViaWorkspace = [];
   const subscribed = [];
   const injectedDeps = [];
   const disposers = [];
   const state = { current, byId, phase };
-  const ctx = {
-    sessions: {
-      list: {
-        getSnapshot: () => ({ ...state }),
-        subscribe: (fn) => {
-          subscribed.push(fn);
-          return () => {};
-        },
+  const sessions = {
+    list: {
+      getSnapshot: () => ({ ...state }),
+      subscribe: (fn) => {
+        subscribed.push(fn);
+        return () => {};
       },
-      open: (id) => opened.push(id),
     },
-    // 生产代码用 ctx.inject(['sessions'], cb) 在服务就绪后接管；
+  };
+  // dsh 0.1.7 的 ClientSessions 上已无 open；sessionsOpen:false 用来模拟它
+  if (sessionsOpen) sessions.open = (id) => opened.push(id);
+  const ctx = {
+    sessions,
+    // 生产代码用 ctx.inject([...], cb) 在服务就绪后接管；
     // 这里同步回调，模拟「服务已就绪」。
     inject: (deps, cb) => {
       injectedDeps.push(deps);
@@ -155,12 +164,17 @@ function makeClientCtx({ current = 's1', byId = { s1: {}, s2: {} }, phase = 'rea
       state.current = id;
     },
     opened,
+    openedViaWorkspace,
     subscribed,
     injectedDeps,
     dispose: () => {
       for (const d of disposers.splice(0)) d();
     },
   };
+  // dsh 0.1.7 的会话切换服务
+  if (withWorkspace) {
+    ctx.uiWorkspace = { openSession: (id) => openedViaWorkspace.push(id) };
+  }
   return ctx;
 }
 
@@ -199,9 +213,9 @@ test('导出 apply 与 inject，且刻意不声明 inject 依赖（避免 apply 
   assert.deepEqual(mod.clientModule.inject, [], 'inject 必须为空，否则 sessions 不可用时插件会完全静默');
 });
 
-test('apply 内部按需注入 sessions', async () => {
+test('apply 内部按需注入 sessions 与 uiWorkspace（都不写进 inject 数组，避免被阻塞）', async () => {
   const { ctx } = await boot();
-  assert.deepEqual(ctx.injectedDeps, [['sessions']]);
+  assert.deepEqual(ctx.injectedDeps, [['sessions'], ['uiWorkspace']]);
 });
 
 test('apply 后立即上报一次 presence 到正确端点', async () => {
@@ -268,6 +282,53 @@ test('拿不到当前会话时退化为页面级上报（仍发请求，但不�
   assert.equal(body.focused, true);
 });
 
+// ── dsh 0.1.7：视图选择搬出 sessions 控制器 ─────────────────────────────────
+
+test('0.1.7：快照没有 current 时，用 retainedBy.mainView 判定正在看的会话', async () => {
+  const { mod } = await boot(
+    {},
+    {
+      current: '',
+      byId: {
+        s1: { id: 's1', retainedBy: { other: 2 } },
+        s2: { id: 's2', retainedBy: { mainView: 1 } },
+      },
+    },
+  );
+  const presence = mod.fetchCalls.filter((c) => JSON.parse(c.init.body).op === 'presence');
+  assert.ok(presence.length >= 1, '仍应上报');
+  assert.equal(JSON.parse(presence.at(-1).init.body).sessionId, 's2', '应以 mainView retain 的那条为准');
+});
+
+test('0.1.7：byId 里没有任何 mainView retain 时退化为页面级上报', async () => {
+  const { mod } = await boot(
+    {},
+    {
+      current: '',
+      byId: {
+        s1: { id: 's1', retainedBy: {} },
+        s2: { id: 's2', retainedBy: { other: 3 } },
+      },
+    },
+  );
+  const presence = mod.fetchCalls.filter((c) => JSON.parse(c.init.body).op === 'presence');
+  const body = JSON.parse(presence.at(-1).init.body);
+  assert.equal('sessionId' in body, false, '没有归因就不该编造一个会话 id');
+});
+
+test('0.1.7：retainedBy 结构缺失/异常时不会崩，退化为页面级', async () => {
+  const { mod } = await boot(
+    {},
+    {
+      current: '',
+      byId: { s1: { id: 's1' }, s2: { id: 's2', retainedBy: null } },
+    },
+  );
+  const presence = mod.fetchCalls.filter((c) => JSON.parse(c.init.body).op === 'presence');
+  assert.ok(presence.length >= 1);
+  assert.equal('sessionId' in JSON.parse(presence.at(-1).init.body), false);
+});
+
 test('切换会话时通过 list.subscribe 立刻重报新会话', async () => {
   const { mod, ctx } = await boot();
   assert.equal(ctx.subscribed.length, 1, '应订阅会话列表');
@@ -313,6 +374,39 @@ test('无 focus 参数时不会 open 任何会话', async () => {
   const { ctx } = await boot();
   await new Promise((r) => setTimeout(r, 30));
   assert.deepEqual(ctx.opened, []);
+});
+
+test('0.1.7：sessions 上无 open 时，回跳改走 uiWorkspace.openSession', async () => {
+  const { ctx } = await boot(
+    { search: `?${FOCUS_PARAM}=s2` },
+    { sessionsOpen: false, withWorkspace: true },
+  );
+  await new Promise((r) => setTimeout(r, 30));
+  assert.deepEqual(ctx.openedViaWorkspace, ['s2'], '应通过 uiWorkspace 切到目标会话');
+  assert.deepEqual(ctx.opened, [], '0.1.7 不该再去碰已移除的 sessions.open');
+});
+
+test('0.1.7：待跳转回执同样走 uiWorkspace.openSession', async () => {
+  const { ctx } = await boot(
+    { pendingFocusReply: 's2' },
+    { sessionsOpen: false, withWorkspace: true },
+  );
+  await new Promise((r) => setTimeout(r, 30));
+  assert.deepEqual(ctx.openedViaWorkspace, ['s2']);
+});
+
+test('0.1.7：uiWorkspace 晚于 sessions 就绪时仍能切过去（切换时现取）', async () => {
+  // 先按「workspace 还没注入」建 ctx，apply 之后再挂上服务，模拟注入回调晚到
+  const mod = await loadClientModule({ search: `?${FOCUS_PARAM}=s2` });
+  const ctx = makeClientCtx({ sessionsOpen: false });
+  mod.clientModule.apply(ctx);
+  loaded.push({ mod, ctx });
+
+  // switchTo 会重试；此时补上 uiWorkspace 服务
+  const openedViaWorkspace = [];
+  ctx.uiWorkspace = { openSession: (id) => openedViaWorkspace.push(id) };
+  await new Promise((r) => setTimeout(r, 400));
+  assert.deepEqual(openedViaWorkspace, ['s2']);
 });
 
 // ── 待跳转会话（点击 Toast 回跳的主通路）─────────────────────────────────────

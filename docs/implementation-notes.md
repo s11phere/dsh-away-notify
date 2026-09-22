@@ -1,4 +1,4 @@
-# 实现说明（针对 dsh `0.1.6-alpha.1`）
+# 实现说明（针对 dsh `0.1.6` / `0.1.7`）
 
 [← 返回 README](../README.md)
 
@@ -11,7 +11,7 @@
 ```
 浏览器（lib/client.js）                        宿主（lib/host.js）
 ┌────────────────────────────┐   POST /api/    ┌──────────────────────────────┐
-│ sessions.list 当前会话      │  dsh-away-notify│ connection.fetch.register     │
+│ 当前会话（§4.1 有版本差异） │  dsh-away-notify│ connection.fetch.register     │
 │ visibilitychange / focus /  │ ───────────────►│   → PresenceStore(TTL 45s)    │
 │ blur / 心跳 15s             │                 │                               │
 │                             │                 │ ctx.on('session/event')       │
@@ -84,9 +84,33 @@ fetch('/api/dsh-away-notify',{method:'POST',headers:{'content-type':'application
 
 ---
 
-## 4. 针对 `0.1.6-alpha.1` 的实现要点
+## 4. 针对 dsh `0.1.6` / `0.1.7` 的实现要点
 
 写这个插件时踩到并绕开的坑，都在代码注释里标了位置，这里汇总：
+
+### 4.1 `0.1.7` 的客户端 API 迁移（浏览器半部）
+
+`0.1.7` 把「视图选择」从 sessions 控制器里搬了出去（该控制器源码注释：
+*"Host catalog and local reference allocator; view selection remains outside the Controller."*），
+浏览器半部因此有两个 API 失效。两处都写成「先试旧、再试新」的兼容形式，
+所以同一个 bundle 在 `0.1.6` 与 `0.1.7` 上都能工作：
+
+| 用途 | `0.1.6` | `0.1.7` 替代 | 失效后果（若只写旧 API） |
+|---|---|---|---|
+| 用户正在看哪个会话 | `sessions.list.getSnapshot().current` | `byId[].retainedBy.mainView > 0` 的那条 | 上报退化为无 sessionId → 宿主进入页面级模式，`dismissOnReturn` 永远匹配不上，通知不再随你回到会话而撤回 |
+| 切到目标会话 | `sessions.open(id)` | `uiWorkspace.openSession(id)` | 点击通知回跳静默失败（异常被吞，重试 40 次后放弃） |
+
+`0.1.7` 的列表快照只剩 `{ids, byId, phase, projectionsBySession}`，`current` **不再被任何人写入**，
+所以不能只判断「字段不存在」，而要在 `byId` 里找主视图 retain 的那条
+（`dsh-client-ui-session` 的 `publishMain` 是它的唯一写入方）。
+`uiWorkspace` 可能晚于 `sessions` 就绪，因此切换 API 是**调用时现取**，不是 `apply` 时缓存。
+
+其余宿主侧契约在 `0.1.7` 上未变（已逐条核对）：`session/event`、`turn/end` 的四种
+reason、`goal/change` 的 `complete`/`block`、`approval/asked` 的 `toolName`/`reason`、
+`approval/policy`、`user-questions/request` waterfall、`connection.fetch.register`、
+`sessionTitle.get`、`sessionProjections.snapshot`、`webServer.port`、`connection.authenticatedUrl`。
+
+### 4.2 `0.1.6` 时代就存在的坑
 
 1. **不能用 `connection.rpc.handle`**。它在 0.1.6 上不可用：内部执行 `owner.webServer.register(route)`，
    而 `owner` 是 connection 插件自己的 ctx，那个 ctx 从未注入 `webServer`（`/api` 路由是在
