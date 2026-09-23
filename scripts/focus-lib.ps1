@@ -10,6 +10,16 @@
 # (Process.GetProcessesByName x3 = 0.45-0.65s); it is now a single EnumWindows pass
 # (single-digit ms). Measured breakdown lives in the README section on click latency.
 #
+# THREE ways a click can reach the dsh page, in order:
+#   1. the window title already holds marker + tag -> the dsh tab IS active, focus
+#      the window (Find-DshWindow + Focus-DshWindow);
+#   2. the dsh tab is in the background -> UI Automation finds the browser's TabItem
+#      and selects it (Get-DshTabCandidates + Select-DshTabItem). A minimized
+#      Chromium window exposes NO TabItem at all, so the known window is restored
+#      first (Restore-DshWindow) and the search is retried;
+#   3. nothing selectable -> focus the known window and open the URL, so a click
+#      never strands you on whatever tab was showing.
+#
 # THIS FILE MUST STAY PURE ASCII: Windows PowerShell 5.1 reads a .ps1 without a
 # BOM using the ANSI code page, and any non-ASCII character makes it fail to
 # parse the whole script.
@@ -89,6 +99,22 @@ function Focus-DshWindow {
   return $ok
 }
 
+# Undo SW_MINIMIZE (9 = SW_RESTORE). Returns $true when the window had been
+# minimized. Restoring also activates the window, which is what makes the browser
+# publish its tab strip to UI Automation again.
+#
+# Measured on Edge 153 / Windows 10: a minimized Chromium window exposes
+# FromHandle fine but FindAll(Descendants, TabItem) returns 0 tabs (probed twice,
+# 24-36ms each); after SW_RESTORE the same window exposes its 2 TabItems ~95ms
+# later. That is the whole "click only focuses the window and leaves the previous
+# tab showing" bug: the tab search could not see anything to select.
+function Restore-DshWindow {
+  param([IntPtr]$Handle)
+  if (-not [DshNotify.Native]::IsIconic($Handle)) { return $false }
+  [void][DshNotify.Native]::ShowWindow($Handle, 9)
+  return $true
+}
+
 # Decode dshnotify:<base64url> into the target URL. base64 keeps `&`, quotes and
 # `%` from being mangled on the command line -> registry -> ShellExecute chain.
 function ConvertFrom-DshnotifyUri {
@@ -131,6 +157,83 @@ function Get-DshInstanceTag {
 # matters most with several dsh instances: only one of their tabs can be active, so
 # for the others title matching always fails.
 if ($null -eq $script:DshWindowCache) { $script:DshWindowCache = @{} }
+# Where to persist that cache, when the caller has a spool directory (the resident
+# helper does). The in-memory map dies with the process, and the helper is
+# restarted by every plugin load / dsh restart; without the file, the first click
+# after a restart cannot tell which browser window belongs to this instance, so a
+# minimized browser would end up with a duplicate tab instead of the right one.
+if ($null -eq $script:DshWindowCacheFile) { $script:DshWindowCacheFile = '' }
+if ($null -eq $script:DshWindowCacheLoaded) { $script:DshWindowCacheLoaded = $false }
+if ($null -eq $script:DshWindowCacheDirty) { $script:DshWindowCacheDirty = $false }
+if ($null -eq $script:UiaReady) { $script:UiaReady = $null }
+
+function Set-DshWindowCacheFile {
+  param([string]$Path)
+  $script:DshWindowCacheFile = [string]$Path
+  $script:DshWindowCacheLoaded = $false
+}
+
+function Set-DshWindowCacheEntry {
+  param([string]$Key, [IntPtr]$Handle)
+  if ($script:DshWindowCache.ContainsKey($Key)) {
+    if ($script:DshWindowCache[$Key] -ne $Handle) { $script:DshWindowCacheDirty = $true }
+  } else {
+    $script:DshWindowCacheDirty = $true
+  }
+  $script:DshWindowCache[$Key] = $Handle
+}
+
+function Remove-DshWindowCacheEntry {
+  param([string]$Key)
+  if ($script:DshWindowCache.ContainsKey($Key)) {
+    [void]$script:DshWindowCache.Remove($Key)
+    $script:DshWindowCacheDirty = $true
+  }
+}
+
+# Read "<marker>|<tag><TAB><hwnd>" lines once per process. Dead handles are
+# dropped on use (Find-DshWindow checks IsWindow), not here.
+function Import-DshWindowCache {
+  if ($script:DshWindowCacheLoaded) { return }
+  $script:DshWindowCacheLoaded = $true
+  if ([string]::IsNullOrEmpty($script:DshWindowCacheFile)) { return }
+  try {
+    if (-not (Test-Path -LiteralPath $script:DshWindowCacheFile)) { return }
+    foreach ($raw in @(Get-Content -LiteralPath $script:DshWindowCacheFile -ErrorAction SilentlyContinue)) {
+      $line = [string]$raw
+      if ($line.Length -eq 0) { continue }
+      $parts = $line.Split([char]9)
+      if ($parts.Length -lt 2) { continue }
+      $value = [long]0
+      if (-not [long]::TryParse($parts[1], [ref]$value)) { continue }
+      if ($value -le 0) { continue }
+      $script:DshWindowCache[$parts[0]] = [IntPtr]$value
+    }
+  } catch {
+  }
+}
+
+# Atomic-ish rewrite (temp name + move) and prune handles whose window is gone.
+function Save-DshWindowCache {
+  if (-not $script:DshWindowCacheDirty) { return }
+  if ([string]::IsNullOrEmpty($script:DshWindowCacheFile)) { return }
+  try {
+    $lines = @()
+    foreach ($key in @($script:DshWindowCache.Keys)) {
+      $handle = [IntPtr]$script:DshWindowCache[$key]
+      if (-not [DshNotify.Native]::IsWindow($handle)) {
+        [void]$script:DshWindowCache.Remove($key)
+        continue
+      }
+      $lines += ($key + [char]9 + ([long]$handle).ToString())
+    }
+    $tmp = $script:DshWindowCacheFile + '.tmp'
+    [System.IO.File]::WriteAllLines($tmp, [string[]]$lines, [System.Text.Encoding]::ASCII)
+    Move-Item -LiteralPath $tmp -Destination $script:DshWindowCacheFile -Force
+    $script:DshWindowCacheDirty = $false
+  } catch {
+  }
+}
 
 # Pick the window whose title holds both the marker and (when tag mode is on) this
 # instance's port tag. Titles come from one EnumWindows pass; matching is literal
@@ -156,11 +259,12 @@ function Find-DshWindow {
   }
   $key = $Marker + '|' + $Tag
   if ($null -ne $target) {
-    $script:DshWindowCache[$key] = $target.Handle
+    Set-DshWindowCacheEntry -Key $key -Handle $target.Handle
     return [pscustomobject]@{ Target = $target; MarkerCount = $byMarker.Count; FromCache = $false }
   }
   # Title miss: the dsh tab is most likely just not the active one anymore, so fall
   # back to the window we matched last time instead of opening a duplicate tab.
+  Import-DshWindowCache
   $cached = $script:DshWindowCache[$key]
   if ($null -ne $cached -and [DshNotify.Native]::IsWindow($cached)) {
     $fallback = [pscustomobject]@{ Handle = $cached; Pid = 0; Title = '(last matched window)' }
@@ -169,34 +273,36 @@ function Find-DshWindow {
   return [pscustomobject]@{ Target = $null; MarkerCount = $byMarker.Count; FromCache = $false }
 }
 
-# Find, via UI Automation, the browser tab that holds this instance's dsh page, and
-# select it.
-#
-# Why this exists: the OS window title only reflects the browser's *active* tab, so
-# as soon as the user switches to another tab the marker and the port tag vanish from
-# the title and title matching fails. Chromium and Firefox do expose every tab as a
-# UI Automation TabItem, titled with that tab's own page title - so the tab can still
-# be found and selected, which is what actually brings the dsh page back. Focusing a
-# window alone would leave the user on whatever tab was showing.
-#
-# @returns {Hwnd, Selected} of the matching tab, or $null when there is none.
-function Select-DshTab {
-  param(
-    [string]$Marker,
-    [string]$Tag,
-    [IntPtr]$PreferHandle = [IntPtr]::Zero
-  )
+# Only these window classes expose browser tabs as UIA TabItems; everything else
+# (including Electron apps such as VS Code, which share Chrome_WidgetWin) is
+# skipped before a tree walk.
+function Test-BrowserClassName {
+  param([string]$ClassName)
+  if ([string]::IsNullOrEmpty($ClassName)) { return $false }
+  if ($ClassName.IndexOf('Chrome_WidgetWin', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }
+  if ($ClassName.IndexOf('MozillaWindowClass', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }
+  return $false
+}
+
+# Load the UIA client assemblies once per process (the resident helper pays it at
+# first use; a cold one-shot pays it as before).
+function Initialize-Uia {
+  if ($null -ne $script:UiaReady) { return [bool]$script:UiaReady }
+  $script:UiaReady = $false
   try {
     Add-Type -AssemblyName UIAutomationClient -ErrorAction SilentlyContinue
     Add-Type -AssemblyName UIAutomationTypes -ErrorAction SilentlyContinue
+    $script:UiaReady = $true
   } catch {
-    return $null
+    $script:UiaReady = $false
   }
-  $tabCondition = New-Object System.Windows.Automation.PropertyCondition(
-    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-    [System.Windows.Automation.ControlType]::TabItem)
+  return [bool]$script:UiaReady
+}
 
-  # The window we matched last time first (cheap), then every other visible window.
+# UI Automation candidates, the window we matched last time first (cheap), then
+# every other visible window.
+function Get-UiaCandidateHandles {
+  param([IntPtr]$PreferHandle = [IntPtr]::Zero)
   $candidates = New-Object System.Collections.ArrayList
   if ($PreferHandle -ne [IntPtr]::Zero) { [void]$candidates.Add($PreferHandle) }
   foreach ($line in [DshNotify.Native]::ListWindowTitles()) {
@@ -206,18 +312,46 @@ function Select-DshTab {
     if ($handle -eq $PreferHandle) { continue }
     [void]$candidates.Add($handle)
   }
+  return $candidates
+}
 
-  foreach ($handle in $candidates) {
+# Find, via UI Automation, the browser tab(s) that hold this instance's dsh page.
+#
+# Why this exists: the OS window title only reflects the browser's *active* tab, so
+# as soon as the user switches to another tab the marker and the port tag vanish from
+# the title and title matching fails. Chromium and Firefox do expose every tab as a
+# UI Automation TabItem, titled with that tab's own page title - so the tab can still
+# be found and selected, which is what actually brings the dsh page back. Focusing a
+# window alone would leave the user on whatever tab was showing.
+#
+# An empty $Tag asks for the marker-only ("loose") pass: that is how a page whose
+# title predates the tag (stale client bundle after an update) can still be found.
+#
+# @returns ArrayList of { Hwnd, Element, Name }; with -CollectAll every match,
+#          otherwise the first one (the hot path must not walk every browser).
+function Get-DshTabCandidates {
+  param(
+    [string]$Marker,
+    [string]$Tag,
+    [IntPtr]$PreferHandle = [IntPtr]::Zero,
+    [switch]$CollectAll,
+    [switch]$OnlyPrefer
+  )
+  $matches = New-Object System.Collections.ArrayList
+  if (-not (Initialize-Uia)) { return $matches }
+  $tabCondition = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+    [System.Windows.Automation.ControlType]::TabItem)
+  $handles = @(Get-UiaCandidateHandles -PreferHandle $PreferHandle)
+  if ($OnlyPrefer) { $handles = @($PreferHandle) }
+  foreach ($handle in $handles) {
+    if ($handle -eq [IntPtr]::Zero) { continue }
     $root = $null
     try { $root = [System.Windows.Automation.AutomationElement]::FromHandle($handle) } catch { continue }
     if ($null -eq $root) { continue }
     $className = ''
     try { $className = [string]$root.Current.ClassName } catch { continue }
-    # Only these expose tabs as TabItems; skip everything else without a tree walk.
-    $isBrowser = $false
-    if ($className.IndexOf('Chrome_WidgetWin', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $isBrowser = $true }
-    if ($className.IndexOf('MozillaWindowClass', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $isBrowser = $true }
-    if (-not $isBrowser) { continue }
+    if (-not (Test-BrowserClassName $className)) { continue }
     $tabs = $null
     try { $tabs = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $tabCondition) } catch { continue }
     foreach ($tab in $tabs) {
@@ -225,21 +359,38 @@ function Select-DshTab {
       try { $name = [string]$tab.Current.Name } catch { continue }
       if (-not (Test-TitleContains $name $Marker)) { continue }
       if (-not [string]::IsNullOrEmpty($Tag) -and -not (Test-TitleContains $name $Tag)) { continue }
-      $pattern = $null
-      $selected = $false
-      try {
-        if ($tab.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$pattern)) {
-          $pattern.Select()
-          $selected = $true
-        } elseif ($tab.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) {
-          $pattern.Invoke()
-          $selected = $true
-        }
-      } catch { }
-      return [pscustomobject]@{ Hwnd = $handle; Selected = $selected }
+      [void]$matches.Add([pscustomobject]@{ Hwnd = $handle; Element = $tab; Name = $name })
+      if (-not $CollectAll) { return $matches }
     }
   }
-  return $null
+  return $matches
+}
+
+# Select one matched tab. Returns $false when no UIA pattern applied (the caller
+# still focuses the window, and reports NOT_SELECTED for diagnostics).
+function Select-DshTabItem {
+  param($Match)
+  if ($null -eq $Match) { return $false }
+  $pattern = $null
+  $selected = $false
+  try {
+    if ($Match.Element.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$pattern)) {
+      $pattern.Select()
+      $selected = [bool]$pattern.Current.IsSelected
+    } elseif ($Match.Element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) {
+      $pattern.Invoke()
+      $selected = $true
+    }
+  } catch {
+    $selected = $false
+  }
+  # Chromium applies the selection slightly asynchronously; one short re-check
+  # keeps a successful switch from being reported as NOT_SELECTED.
+  if (-not $selected -and $null -ne $pattern) {
+    Start-Sleep -Milliseconds 80
+    try { $selected = [bool]$pattern.Current.IsSelected } catch { }
+  }
+  return $selected
 }
 
 # The whole handler. Returns a single ASCII status line (the helper records it
@@ -254,47 +405,132 @@ function Invoke-DshFocus {
   try {
     $url = ConvertFrom-DshnotifyUri -Uri $Uri
     $tag = Get-DshInstanceTag -Url $url -TagMode $TagMode
+    $key = $Marker + '|' + $tag
+    Import-DshWindowCache
 
     # Fast path: the window title already carries this instance's marker + tag, so
     # the dsh tab IS the active one and focusing the window is enough.
     $found = Find-DshWindow -Marker $Marker -Tag $tag
     if ($null -ne $found.Target -and -not $found.FromCache) {
       $ok = Focus-DshWindow -Handle $found.Target.Handle
+      Save-DshWindowCache
       return 'FOCUSED hwnd=' + $found.Target.Handle + ' ok=' + $ok + ' tag=' + $tag
     }
 
-    # The dsh tab is not the active one. Ask UI Automation for the tab itself and
-    # select it: focusing the window alone would leave the user on whatever tab was
-    # showing (and used to open a duplicate tab instead).
+    # The dsh tab is not the active one. We usually know which window it belongs to
+    # (the cache), and a MINIMIZED Chromium window exposes no TabItem at all, so
+    # restore it before asking UI Automation for the tab. Restoring also activates
+    # the window; the browser publishes its tab strip ~100ms later, which is what
+    # the retry loop below waits for.
     $prefer = [IntPtr]::Zero
-    if ($null -ne $found.Target) { $prefer = $found.Target.Handle }
-    $tab = Select-DshTab -Marker $Marker -Tag $tag -PreferHandle $prefer
+    $restored = $false
+    $uiaReady = Initialize-Uia
+    if ($null -ne $found.Target) {
+      $prefer = $found.Target.Handle
+      if ($uiaReady) {
+        $className = Get-WindowClassName -Handle $prefer
+        if (-not (Test-BrowserClassName $className)) {
+          # The cached handle no longer points at a browser window (it was recycled
+          # after the browser closed): forget it instead of restoring a stranger.
+          Remove-DshWindowCacheEntry -Key $key
+          Save-DshWindowCache
+          $prefer = [IntPtr]::Zero
+        } elseif ([DshNotify.Native]::IsIconic($prefer)) {
+          $restored = Restore-DshWindow -Handle $prefer
+        }
+      } elseif ([DshNotify.Native]::IsIconic($prefer)) {
+        # No UI Automation here (assembly missing / policy): we cannot verify the
+        # handle by class, but a window we matched before still beats a duplicate tab.
+        $restored = Restore-DshWindow -Handle $prefer
+      }
+    }
+
+    $attempts = 1
+    if ($restored) { $attempts = 5 } elseif ($null -ne $found.Target) { $attempts = 2 }
+    $used = 0
+    $tab = $null
+    for ($i = 1; $i -le $attempts; $i++) {
+      $used = $i
+      # @() keeps a one-element result scalar-safe (a bare ArrayList return gets
+      # unrolled by the pipeline, and a scalar has no .Count).
+      $match = @(Get-DshTabCandidates -Marker $Marker -Tag $tag -PreferHandle $prefer)
+      if ($match.Count -gt 0) { $tab = $match[0]; break }
+      if ($i -lt $attempts) { Start-Sleep -Milliseconds 120 }
+    }
+
     if ($null -ne $tab) {
+      $selected = Select-DshTabItem -Match $tab
       $ok = Focus-DshWindow -Handle $tab.Hwnd
-      $script:DshWindowCache[$Marker + '|' + $tag] = $tab.Hwnd
+      Set-DshWindowCacheEntry -Key $key -Handle $tab.Hwnd
+      Save-DshWindowCache
       $extra = ''
-      if (-not $tab.Selected) { $extra = ' NOT_SELECTED' }
+      if ($restored) { $extra += ' RESTORED' }
+      if ($used -gt 1) { $extra += ' retry=' + $used }
+      if (-not $selected) { $extra += ' NOT_SELECTED' }
       return 'TAB_FOCUSED hwnd=' + $tab.Hwnd + ' ok=' + $ok + ' tag=' + $tag + $extra
     }
 
-    # No tab anywhere: keep the last matched window (never a duplicate tab) ...
-    if ($null -ne $found.Target) {
-      $ok = Focus-DshWindow -Handle $found.Target.Handle
-      return 'FOCUSED hwnd=' + $found.Target.Handle + ' ok=' + $ok + ' tag=' + $tag + ' CACHED'
+    # No tab matched marker + tag. A page loaded before the title tag existed (the
+    # old client bundle survives in an open tab until the page is refreshed) still
+    # matches the marker alone. Look for it ONLY inside the window we already know
+    # to be this instance's: a global marker-only search would happily land on a
+    # second dsh instance's tab whenever this instance's own window is invisible to
+    # UI Automation (measured: a minimized window exposes no TabItem at all, so the
+    # "unique marker match" would be the *other* instance).
+    if (-not [string]::IsNullOrEmpty($tag) -and $prefer -ne [IntPtr]::Zero) {
+      $loose = @(Get-DshTabCandidates -Marker $Marker -Tag '' -PreferHandle $prefer -OnlyPrefer -CollectAll)
+      if ($loose.Count -eq 1) {
+        $selected = Select-DshTabItem -Match $loose[0]
+        $ok = Focus-DshWindow -Handle $loose[0].Hwnd
+        Set-DshWindowCacheEntry -Key $key -Handle $loose[0].Hwnd
+        Save-DshWindowCache
+        $extra = ' NO_TAG'
+        if (-not $selected) { $extra += ' NOT_SELECTED' }
+        return 'TAB_FOCUSED hwnd=' + $loose[0].Hwnd + ' ok=' + $ok + ' tag=' + $tag + $extra
+      }
     }
 
-    # ... and only then open the URL. Distinguish "the marker matched nothing" from
-    # "it matched, but not this instance" - the latter is what the port tag catches.
-    $why = 'NO_WINDOW'
-    if (-not [string]::IsNullOrEmpty($tag)) {
-      $why = 'TAG_MISS tag=' + $tag + ' marker_windows=' + $found.MarkerCount
+    # Nothing selectable. Bring the window we know forward (never a duplicate tab
+    # while we still know the window), report why, and - unless the operator turned
+    # the fallback off - open the URL as well. Leaving the user on whatever tab was
+    # showing is the bug this whole file exists to prevent, and an extra tab is the
+    # lesser evil.
+    $line = ''
+    if ($null -ne $found.Target) {
+      $ok = Focus-DshWindow -Handle $found.Target.Handle
+      $line = 'FOCUSED hwnd=' + $found.Target.Handle + ' ok=' + $ok + ' tag=' + $tag + ' CACHED'
+    } else {
+      # The cached handle is gone (or was never a browser window): forget it, so the
+      # next click starts clean instead of restoring an unrelated window.
+      Remove-DshWindowCacheEntry -Key $key
+      Save-DshWindowCache
+      # Distinguish "the marker matched nothing" from "it matched, but not this
+      # instance" - the latter is what the port tag catches.
+      $line = 'NO_WINDOW'
+      if (-not [string]::IsNullOrEmpty($tag)) {
+        $line = 'TAG_MISS tag=' + $tag + ' marker_windows=' + $found.MarkerCount
+      }
     }
     if ($OpenFallback -and -not [string]::IsNullOrEmpty($url)) {
       Start-Process $url | Out-Null
-      return $why + ' OPENED'
+      return $line + ' OPENED'
     }
-    return $why
+    return $line
   } catch {
     return 'ERROR ' + $_.Exception.Message
+  }
+}
+
+# Class name of a top-level window handle via UI Automation (used only to sanity
+# check a cached handle before restoring it).
+function Get-WindowClassName {
+  param([IntPtr]$Handle)
+  if (-not (Initialize-Uia)) { return '' }
+  try {
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($Handle)
+    if ($null -eq $root) { return '' }
+    return [string]$root.Current.ClassName
+  } catch {
+    return ''
   }
 }

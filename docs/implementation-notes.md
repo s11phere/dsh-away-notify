@@ -1,4 +1,4 @@
-# 实现说明（针对 dsh `0.1.6` / `0.1.7`）
+# 实现说明（面向 dsh `0.1.7-rc.1`，兼容 `0.1.6` / `0.1.7`）
 
 [← 返回 README](../README.md)
 
@@ -16,7 +16,7 @@
 │ blur / 心跳 15s             │                 │                               │
 │                             │                 │ ctx.on('session/event')       │
 │ ?dshAwayNotifyFocus=<id>    │                 │   turn/end · approval/asked   │
-│   → sessions.open(id)       │                 │   goal/change · user/message  │
+│   → uiWorkspace.openSession │                 │   goal/change · user/message  │
 └────────────────────────────┘                 │ ctx.on('user-questions/request')│
                                                 │        │                      │
                                                 │   policy.decide()             │
@@ -40,7 +40,7 @@
 | `lib/protocol.js` | `dshnotify:` 协议：URI 编解码、注册表命令组装（enqueue / direct 两态） |
 | `scripts/enqueue-focus.vbs` | 点击入口：只写请求文件，顺带保证助手活着（快路径） |
 | `scripts/focus-helper.ps1` | 常驻助手：FileSystemWatcher 唤醒后置前（快路径的执行者） |
-| `scripts/focus-lib.ps1` | 共享逻辑：一次 `EnumWindows` 找窗口（marker + 端口 tag 字面匹配）、UI Automation 选中标签页、置前、窗口缓存兜底、最后才开 URL |
+| `scripts/focus-lib.ps1` | 共享逻辑：一次 `EnumWindows` 找窗口（marker + 端口 tag 字面匹配）、还原最小化窗口后按 120ms 重试 UI Automation 选标签页、已知窗口内的缺 tag 宽松兜底、窗口缓存（含落盘）、最后才开 URL |
 | `scripts/focus-or-open.ps1` | 一次性处理器：助手不可用时的冷回退，也可手工调试 |
 | `scripts/run-hidden.vbs` | 无窗口闪烁启动 PowerShell（助手启动与冷回退共用） |
 | `scripts/selftest-notify.mjs` | 脱离 dsh 单独验证通知通道并回读通知中心 |
@@ -110,6 +110,26 @@ reason、`goal/change` 的 `complete`/`block`、`approval/asked` 的 `toolName`/
 `approval/policy`、`user-questions/request` waterfall、`connection.fetch.register`、
 `sessionTitle.get`、`sessionProjections.snapshot`、`webServer.port`、`connection.authenticatedUrl`。
 
+#### 4.1.1 `0.1.7-rc.1` 复核（2026-09-24）
+
+在安装好的 `@deepseek-ai/dsh@0.1.7-rc.1` 上按**包内类型声明**逐项复核了本插件接触的每个
+契约，结论是全部未变（因此本次修复不需要任何版本分支）：
+
+| 契约 | 复核位置（rc.1 包内） | 结论 |
+|---|---|---|
+| 客户端 bundle 装载协议 | `dsh-client-modules`（`window.__ModuleLoader__.load({id, factory})`、`dsh.client` 声明解析） | 未变；`dsh.client.inject` 仍被解析（`external` 是新增的另一项，本插件两者都为空） |
+| 当前会话判定 | `dsh-api-session-controller` 的 `SessionListState`（`ids/byId/phase/projectionsBySession`）+ `dsh-client-ui-session` 的 `publishMain` | `byId[].retainedBy.mainView` 仍是唯一写入方，`dsh-client-ui-layout` 也用同一形状 |
+| 会话切换 | `dsh-client-ui-workspace` 的 `UiWorkspace.openSession(target: SessionTarget)` | 存在，签名兼容 |
+| 列表订阅 | `dsh-client-store` 的 `ObservableSnapshot`（`getSnapshot` / `subscribe`） | 未变 |
+| 浏览器标题 | `dsh-client-ui-layout` 的 `DocumentTitle`（`document.title = "… — DeepSeek Harness"`） | 产品名未变，`focusWindowMarker` 默认值仍然正确 |
+| host 事件 | `dsh-session`（`session/event`、`turn/end.reason` 的 `completed/aborted/blocked/error/max-tokens/interrupted/forked`）、`dsh-goal`（`goal/change.operation` 含 `complete`/`block`）、`dsh-user-approval`（`approval/asked` / `approval/policy`，取值 `ask`/`never`）、`dsh-user-questions`（`user-questions/request` waterfall、`request.agent.id`、`request.questions[].question`） | 全部未变 |
+| host 服务 | `dsh-client-connection` 的 `HostConnectionHandle`（`fetch.register` / `authenticatedUrl`）、`dsh-session-title.get`、`dsh-session-projection`（`snapshot(session, keys) → { values }`） | 全部未变 |
+
+真机旁证（同一台机器）：插件加载后焦点助手在 **dsh 启动的同一秒**被拉起（host 半部执行了
+`startFocusHelper` + 注册协议），浏览器标签标题带 `[dsh:3080]` 后缀（client 半部执行了
+`apply`），`HKCU\Software\Classes\dshnotify` 命令指向本检出与 spool——即 rc.1 上两侧都真的
+接线成功，而不仅仅是类型上兼容。
+
 ### 4.2 `0.1.6` 时代就存在的坑
 
 1. **不能用 `connection.rpc.handle`**。它在 0.1.6 上不可用：内部执行 `owner.webServer.register(route)`，
@@ -147,6 +167,12 @@ reason、`goal/change` 的 `complete`/`block`、`approval/asked` 的 `toolName`/
    所以启动焦点助手时 `.vbs` 与 `.ps1` 都经 `toWindowsPath`，并加 `//B` 批处理模式——即使将来
    还有别的错误，也只静默失败，不会弹窗打扰。可执行文件本身仍用 WSL 路径（那是 WSL 侧 `spawn`
    用的）。原生 Windows 上 `toWindowsPath` 直接短路返回。
+
+9. **最小化的 Chromium 窗口对 UI Automation 完全不暴露标签页**（本机 Edge 153 实测：
+   `FromHandle` 成功、`ClassName` 正常，但 `FindAll(Descendants, TabItem)` 返回 **0**；
+   `SW_RESTORE` 后约 **95ms** 才恢复）。点击回跳因此必须先还原窗口再搜标签，并且要重试；
+   否则「窗口提到了前台、人却还在原来那个标签页上」。这一条不是 dsh 版本问题，纯 Windows /
+   Chromium 行为，详见[点击回跳的实测](./click-focus.md#实测最小化的浏览器窗口对-uia-不暴露标签页)。
 
 ---
 

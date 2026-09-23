@@ -27,6 +27,14 @@ param(
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'focus-lib.ps1')
 
+# Persist "which window hosts this instance" next to the requests. The in-memory
+# cache dies with the process, and this helper is restarted by every plugin load /
+# dsh restart; without the file the first click after a restart cannot tell which
+# browser window belongs to this instance. That matters because a minimized
+# Chromium window exposes no tab to UI Automation, so the handle has to be known
+# before the window can be restored (see focus-lib.ps1).
+Set-DshWindowCacheFile (Join-Path $SpoolDir 'window-cache.txt')
+
 # Single instance: a reload can race a still-running helper, and the loser must
 # not start processing the same requests.
 #

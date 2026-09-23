@@ -281,6 +281,55 @@ test('focus-lib.ps1 用 UI Automation 选中 dsh 标签页（标签不在前台�
   assert.match(src, /Chrome_WidgetWin/, '应只对浏览器窗口做 UIA 遍历');
 });
 
+test('focus-lib.ps1 先把最小化窗口还原再做标签搜索（最小化时 Chromium 不暴露 TabItem）', () => {
+  // 真机实测（Edge 153 / Windows 10 Home 25H2）：窗口最小化时 FromHandle 成功、
+  // ClassName 仍是 Chrome_WidgetWin_1，但 FindAll(Descendants, TabItem) 返回 0 个
+  // 标签（两次探测都是 0）；SW_RESTORE 之后约 95ms 才重新暴露标签。旧实现因此
+  // 只会聚焦窗口、把人留在原来那个标签页上（状态行 FOCUSED … CACHED）。
+  const src = readScript('focus-lib.ps1');
+  assert.match(src, /function Restore-DshWindow/, '应有还原最小化窗口的独立步骤');
+  assert.match(src, /Restore-DshWindow -Handle \$prefer/, '搜索前要先还原已知窗口');
+  assert.match(src, /Start-Sleep -Milliseconds 120/, '还原后要给浏览器重建 UIA 树的时间');
+  assert.match(src, /if \(\$restored\) \{ \$attempts = 5 \}/, '还原过就要重试而不是一次就放弃');
+  const restoreAt = src.indexOf('Restore-DshWindow -Handle $prefer');
+  const searchAt = src.indexOf('Get-DshTabCandidates -Marker $Marker -Tag $tag');
+  assert.ok(restoreAt > 0 && searchAt > restoreAt, '还原必须排在第一次标签搜索之前');
+});
+
+test('focus-lib.ps1 把「哪个窗口属于本实例」落盘（助手重启后第一点也能认对窗口）', () => {
+  // 内存里的缓存随进程消失，而助手在每次插件加载 / dsh 重启时都会被重启。没有
+  // 这份落盘缓存，重启后的第一次点击在「浏览器最小化 + dsh 标签不在前台」时就
+  // 认不出窗口，只能退化成多开一个标签页。
+  const src = readScript('focus-lib.ps1');
+  assert.match(src, /Set-DshWindowCacheFile/, '应能指定缓存落盘位置');
+  assert.match(src, /Import-DshWindowCache/, '启动后要读回落盘缓存');
+  assert.match(src, /Save-DshWindowCache/, '命中后要写回');
+  assert.match(src, /IsWindow\(\$handle\)/, '写回时清掉已消失窗口的句柄');
+  const helper = readScript('focus-helper.ps1');
+  assert.match(helper, /window-cache\.txt/, '常驻助手要把缓存落到自己的 spool 里');
+  assert.match(helper, /Set-DshWindowCacheFile/, '常驻助手要接上这份缓存');
+});
+
+test('focus-lib.ps1 只在已知窗口内接受缺 tag 的候选（否则会切到另一个实例）', () => {
+  // 真机踩到过：本实例的窗口最小化时对 UIA 不可见，全局「唯一 marker 命中」会
+  // 命中另一个 dsh 实例的标签页，把用户送到错误实例。所以宽松匹配必须限定在
+  // 已经确认属于本实例的那个窗口里。
+  const src = readScript('focus-lib.ps1');
+  assert.match(src, /-OnlyPrefer/, '宽松匹配必须限制在已知窗口内');
+  assert.match(src, /\$prefer -ne \[IntPtr\]::Zero/, '不知道窗口时根本不做宽松匹配');
+  assert.match(src, /\$loose\.Count -eq 1/, '只有当唯一候选时才接受');
+  assert.match(src, /NO_TAG/, '状态行要标出走的是缺 tag 那条路');
+});
+
+test('focus-lib.ps1 选不中标签页时仍然打开 URL（不再把人留在原标签页）', () => {
+  const src = readScript('focus-lib.ps1');
+  assert.match(src, /' CACHED'/, '仍要区分「窗口聚焦了但标签没选中」');
+  const cachedAt = src.indexOf("' CACHED'");
+  const openedAt = src.indexOf("$line + ' OPENED'");
+  assert.ok(cachedAt > 0 && openedAt > cachedAt, 'CACHED 分支之后也要走兜底打开');
+  assert.match(src, /Start-Process \$url/, '兜底打开仍在');
+});
+
 test('focus-or-open.ps1 与 focus-helper.ps1 共用同一份逻辑，不各写一遍', () => {
   for (const name of ['focus-or-open.ps1', 'focus-helper.ps1']) {
     const src = readScript(name);
