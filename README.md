@@ -26,8 +26,13 @@ goal 完成才弹桌面通知，点击通知能回到对应会话。
   屏幕上，直到你点它、或**切到它对应的那条会话**。撤回是**按会话**的：待在 dsh 里看别的会话不会
   误撤后台会话的通知（早期版本会，已修）
 - **两级前台抑制**：见下方[在场判定](#在场判定)
+- **可被其它插件显式抑制 / 改点击落点**：谁建的会话谁说了算，away-notify 不认识任何插件名，也不做
+  标题/关键词匹配；插件还能声明「点这条通知时开右栏哪个 tab」（见
+  [给其他插件的接口](#给其他插件的接口抑制与点击揭示)）
 - **不做静音黑洞**：在场状态带 45 秒 TTL，标签页崩溃 / 浏览器被关掉后自动视为「离开」，不会永久静音
-- **点击回跳**：Toast 可点击，**优先回到已有的那个 dsh 标签页**，并**自动切到出事的那条会话**。
+- **点击回跳**：Toast 可点击，**优先回到已有的那个 dsh 标签页**，并**自动切到出事的那条会话**；
+  若触发通知的插件声明过[揭示目标](#给其他插件的接口抑制与点击揭示)（例如侧边聊天），则改为在右栏
+  **打开/聚焦它那个 tab**，打不开才退回切会话。
   浏览器窗口**最小化**时也回得去：最小化的 Chromium 窗口对 UI Automation **一个标签都不暴露**，
   所以脚本会先把窗口还原、再选标签页（早期版本在这里只会把窗口提到前台，人却停在原来那个
   标签页上）。真的选不中标签时，宁可多开一个标签页也不把你留在原标签页
@@ -60,13 +65,63 @@ goal 完成才弹桌面通知，点击通知能回到对应会话。
 ```js
 fetch('/api/dsh-away-notify',{method:'POST',headers:{'content-type':'application/json'},
   body:JSON.stringify({op:'state'})}).then(r=>r.json()).then(console.log)
-// -> {ok:true, attended:"session-…", attendedSessions:["session-…"], mode:"session", sessionTracking:true, platform:"windows"}
+// -> {ok:true, attended:"session-…", attendedSessions:["session-…"], mode:"session", sessionTracking:true, platform:"windows", suppressed:{version:1,sessions:[],rules:[]}}
 ```
 
 > 打开浏览器 DevTools 会让页面失焦（`document.hasFocus()` 变 false），插件会判为「离开」——
 > 这是预期行为，不是故障；此时查到的 `mode` 可能是 `away`。
 
 机制细节见 [docs/implementation-notes.md](docs/implementation-notes.md#3-在场判定为什么只在你没看的时候才弹)。
+
+---
+
+## 给其他插件的接口：抑制与点击揭示
+
+有些插件会创建**普通会话**，但它们不希望这类会话打扰用户。最典型的是 `dsh-btw-sidebar`：
+侧边聊天是主会话 fork 出来的普通会话，而浏览器半部上报的「当前会话」永远是主视图那条
+（`retainedBy.mainView`），所以宿主的在场判定**认不出**用户其实正看着侧栏面板里的那一条——
+跑完一轮就会误弹。
+
+修法不是让 away-notify 去匹配会话标题（关键词黑名单只要标题一改就失效，还会把别的插件卷进来），
+而是把「要不要提醒、点了去哪儿」交给**创建会话的那一方**声明。away-notify 通过一个 cordis 服务
+开放这个能力（服务名 `awayNotify`，实现见 [lib/suppress.js](lib/suppress.js)）：
+
+```js
+// 在任意宿主侧插件里
+const away = ctx.get('awayNotify')            // 或 ctx.inject(['awayNotify'], (c) => …) 等服务就绪
+if (away) {
+  // ① 抑制
+  const release = away.suppressSession('session-abc', 'my-plugin') // 逐条声明；返回释放函数
+  away.releaseSession('session-abc')                               // 撤销该会话的全部声明
+  away.isSuppressed('session-abc')            // 诊断：返回原因标签或 undefined
+  away.addRule({                              // 按「类」声明：自己决定什么条件下静音
+    id: 'my-plugin',
+    reason: 'my-plugin',
+    match: (sessionId, event, context) =>       // context = { attended, pageAttended }
+      myIds.has(sessionId) && context.pageAttended,
+  })
+
+  // ② 点击揭示：点它的通知时，先在右栏打开这个资源（已在右栏则聚焦那个 tab）
+  away.revealSession('session-abc', { resource: 'dsh-resource://my-plugin/session/abc', reason: 'my-plugin' })
+  away.revealFor('session-abc')               // 诊断：{ resource, reason } | undefined
+  away.snapshot()                             // 诊断：{ version, sessions, rules }
+}
+```
+
+| 行为 | 说明 |
+|---|---|
+| 时机 | 抑制在**在场判定与冷却之前**生效，与「是否刚收到过同类通知」无关；是否与在场有关由调用方的规则决定 |
+| 上下文 | 规则第三个参数是宿主提供的 `{ attended, pageAttended }`——前者「用户正看着这条会话」，后者「用户正看着 dsh 页面（可见 + 有焦点）」。`dsh-btw-sidebar` 就是用它实现「面板**显示在右栏** **且** 你在看时才静音」 |
+| 原因 | `reason` 由调用方给（建议用插件 id），命中时日志写 `已抑制(suppressed:<reason>)` |
+| 揭示 | `revealSession` 声明的地址会随 `op:'pending-focus'` 的应答发回浏览器半部：**先在右栏 `openResource(地址)`**（目标 tab 已开着就聚焦它、没开就新开并展开右栏），失败才退回「切到主视图那条会话」。地址对 away-notify 是不透明字符串 |
+| 隔离 | away-notify **不认识任何具体插件**，也不做标题/关键词匹配；`match` 抛错视为「不抑制」（宁可多弹一条） |
+| 计数 | 逐条声明按 token 引用计数：多个调用方各自释放互不影响；`releaseSession` 一次撤销该会话的**全部**声明（抑制 + 揭示） |
+| 缺失 | 对方没装 / 服务未就绪时 `ctx.get('awayNotify')` 返回 `undefined`，调用方自行降级即可（点击退回主视图） |
+| 版本 | 接口版本在服务对象的 `version` 字段与 `snapshot().version` 里（当前 `1`） |
+
+排障：presence 端点的 `op:'state'` 会回显 `suppressed: { version, sessions, rules }`
+（`sessions` 里同时带 `reason` 与 `reveal`），一眼能看出「这条通知为什么不弹、点了会去哪儿」。
+这是给**宿主侧**插件的通路；浏览器侧插件没有对应接口（客户端半部只负责在场上报与执行揭示）。
 
 ---
 
@@ -205,6 +260,7 @@ dsh 的 Web UI 在端口上要求鉴权（裸访问返回 `401 dsh web authentic
 | 挂上了但不弹 | 先单独验证通道：`node scripts\selftest-notify.mjs`。通道 OK 就开 `debug: true` 看 `已抑制(<原因>)` |
 | 一直不弹，日志里全是 `已抑制(attended-foreground)` | 你正看着那条会话——设计行为。切到别的标签页或别的应用再试 |
 | 日志里是 `已抑制(subagent-session)` | 子代理会话默认不打扰（`rootsOnly: true`） |
+| 日志里是 `已抑制(suppressed:<原因>)` | 别的插件（如 `dsh-btw-sidebar`）显式声明了这条会话不打扰——设计行为，见[给其他插件的接口](#给其他插件的接口抑制与点击揭示) |
 | 点了通知没回到 dsh | 看 `.focus-spool\last-status.txt`：`FOCUSED` / `TAB_FOCUSED` 说明脚本执行了；`TAG_MISS` 说明标题里没有本实例的 tag（检查 `titleTag`、以及页面是否已刷新）；`NO_WINDOW` 说明连 marker 都没匹配到。**`FOCUSED … CACHED`** 表示窗口提到了前台但标签页没选中（浏览器不支持 UI Automation / 组策略禁用）。旧版本遇到「浏览器最小化」就会走到这里——更新插件后**重启 dsh** 让焦点助手换成新脚本 |
 | 第一次点不回去、第二次才行 | 这是 v0.1.7-alpha.1 上的真实缺陷（浏览器最小化时 Chromium 不向 UI Automation 暴露标签页，旧脚本只聚焦不切标签）。本版本已修：先把窗口还原再选标签页。若仍复现，确认 `.focus-spool\last-status.txt` 里有没有 `RESTORED`，并检查助手进程的启动时间是否早于插件更新 |
 | 点了通知多出一个标签页 | 说明标签页确实选不中（旧页面没有 tag、浏览器非 Chromium/Firefox、或 dsh 标签已不存在），脚本按「宁可多开也不把你留在原标签页」处理，状态行以 `OPENED` 结尾 |
@@ -229,7 +285,7 @@ dsh 的 Web UI 在端口上要求鉴权（裸访问返回 `401 dsh web authentic
 
 ## 开发
 
-`policy.js` / `presence.js` / `notifier.js` 都不依赖 DSH 运行时，可以脱离 dsh 单测：
+`policy.js` / `presence.js` / `suppress.js` / `notifier.js` 都不依赖 DSH 运行时，可以脱离 dsh 单测：
 
 ```sh
 node --test

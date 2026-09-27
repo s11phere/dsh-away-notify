@@ -20,9 +20,18 @@
 └────────────────────────────┘                 │ ctx.on('user-questions/request')│
                                                 │        │                      │
                                                 │   policy.decide()             │
-                                                │   （前台抑制 / 冷却 / 过滤）   │
+                                                │   （插件抑制 / 前台抑制 /     │
+                                                │     冷却 / 过滤）             │
                                                 │        ▼                      │
                                                 │   notifier → WinRT Toast      │
+                                                └────────▲──────────────────────┘
+                                                         │ SuppressionRegistry
+                                                         │ ctx.provide('awayNotify')
+                                                         │ ← suppressSession / addRule
+                                                         │ ← revealSession（点击去哪儿）
+                                                ┌────────┴─────────────────────┐
+                                                │ 其它宿主插件（如 btw-sidebar）│
+                                                │ 声明「什么条件下不打扰」      │
                                                 └──────────────────────────────┘
 ```
 
@@ -34,8 +43,9 @@
 |---|---|
 | `lib/host.js` | 宿主插件：事件订阅、状态累计、决策接线、URL 生成、presence 端点、拉起焦点助手 |
 | `lib/client.js` | 浏览器半部：在场上报 + 点击回跳切会话 + 实例标题 tag |
-| `lib/policy.js` | 纯逻辑：五类触发判定、前台抑制、冷却去重、goal 轮次静默 |
+| `lib/policy.js` | 纯逻辑：五类触发判定、显式抑制、前台抑制、冷却去重、goal 轮次静默 |
 | `lib/presence.js` | 纯逻辑：会话级在场状态表 + TTL |
+| `lib/suppress.js` | 纯逻辑：会话通知策略注册表（逐条 claim 引用计数 + 按类规则 + 点击揭示目标），即 `awayNotify` 服务的实现 |
 | `lib/notifier.js` | 通知投递：三态平台探测 + WinRT Toast（持久化 / 撤回）/ notify-send |
 | `lib/protocol.js` | `dshnotify:` 协议：URI 编解码、注册表命令组装（enqueue / direct 两态） |
 | `scripts/enqueue-focus.vbs` | 点击入口：只写请求文件，顺带保证助手活着（快路径） |
@@ -75,12 +85,48 @@
 ```js
 fetch('/api/dsh-away-notify',{method:'POST',headers:{'content-type':'application/json'},
   body:JSON.stringify({op:'state'})}).then(r=>r.json()).then(console.log)
-// -> {ok:true, attended:"session-…", attendedSessions:["session-…"], mode:"session", sessionTracking:true, platform:"windows"}
+// -> {ok:true, attended:"session-…", attendedSessions:["session-…"], mode:"session", sessionTracking:true, platform:"windows", suppressed:{version:1,sessions:[],rules:[]}}
 ```
 
 撤回是**按会话**的：宿主用 `outstanding: Map<tag, sessionId>` 记住每条通知属于哪条会话，只在
 **该会话**被看到时才撤它，外加无会话归属的（如加载自检）。不这样做的话，用户在会话 A 时，
 会话 B 的通知会被 A 每 15 秒一次的心跳顺手撤掉（实测后台会话的通知只活了 2.6 秒）。
+
+### 3.1 抑制与点击揭示（给其它插件的 `awayNotify` 服务）
+
+在场判定只能回答「用户在看**哪条**会话」，回答不了「这条会话是不是**根本不该打扰**」，也
+回答不了「点它的通知该去哪儿」。最典型的反例是 `dsh-btw-sidebar` 的侧边聊天：它是主会话 fork
+出来的普通会话，用户正看着侧栏面板里的它，但浏览器半部上报的「当前会话」永远是主视图那条
+（[§4.1](#41-017-的客户端-api-迁移浏览器半部)），于是 `isAttended(childId)` 为 false，跑完一轮
+就误弹；而点通知又会把它当成一条普通会话、在主视图里开出来。
+
+`lib/suppress.js` 的 `SuppressionRegistry` 同时管这两件事（一条声明可以只抑制、只揭示，或两者
+兼有，互不干扰）：
+
+- `claim(sessionId, reason)` —— 逐条抑制，内部按自增 token 引用计数，返回释放函数；
+  同一会话被多个插件声明时，一个释放不影响另一个。
+- `reveal(sessionId, { resource, reason })` —— 声明「点这条会话的通知时，先在右栏打开这个资源
+  地址」。地址对 away-notify 是不透明字符串，它只负责随 `op:'pending-focus'` 的应答转发；
+  浏览器半部拿它调 `ctx.sidebarRight.openResource(地址)`——右栏按 `contentId`（就是地址本身）
+  查重，**已开着的 tab 会被聚焦而不是重复开一个**；没有 tab 类型认领 / 右栏服务缺失时抛错或
+  缺席，就地退回「切主视图那条会话」。
+- `addRule({ id, reason, match })` —— 按「类」声明；`match(sessionId, event, context)` 的判断权
+  在调用方，`context` 是宿主给的 `{ attended, pageAttended }`（「用户在看这条会话」/「用户在看
+  dsh 页面」），于是「面板显示在右栏 **且** 你在看时才静音」这种语义不需要 away-notify 懂任何业务。
+  规则抛错记为「不命中」（宁可多弹一条，也不能因为第三方插件的 bug 让通知链路失效），错误会进
+  `snapshot()` 供排障。
+- 查询走 `reasonFor(sessionId, event, context)`（逐条声明优先于规则）与 `revealFor(sessionId)`。
+
+`host.js` 用 `ctx.provide('awayNotify', …)` 把注册表开放出去（`version: 1`），`policy.decide`
+里排在场与冷却**之前**判定抑制。为什么不在这里做标题/关键词匹配：那是消费者替生产者猜语义，
+标题一改就失效，还会把别的插件的会话卷进来。为什么不自己写一套「侧边会话」识别：DSH 没有可写的
+会话标记位（`SessionForkRequest` 只有 `sessionId`/`atSeq`，session header 也没有可扩展字段，
+`origin` 只允许 `'subagent'`），所以只能由创建方声明。
+
+跨插件服务的可见性已核实：同为 web profile 里 `insert:` 兄弟条目的 `dsh-workspace-changes` 用
+`ctx.provide("workspaceChanges", …)`，`dsh-client-ui-deliverables` 在 `inject` 里列它后直接
+`ctx.workspaceChanges.summary(...)` 消费。`provide` 会 `notify` 依赖方，因此 away-notify 晚于
+消费方加载也没问题。诊断通路：`op:'state'` 回显 `suppressed`（每条会话带 `reason` 与 `reveal`）。
 
 ---
 
@@ -178,7 +224,7 @@ reason、`goal/change` 的 `complete`/`block`、`approval/asked` 的 `toolName`/
 
 ## 5. 测试约定
 
-`policy.js` / `presence.js` / `notifier.js` 都不依赖 DSH 运行时，因此可以脱离 dsh 单测：
+`policy.js` / `presence.js` / `suppress.js` / `notifier.js` 都不依赖 DSH 运行时，因此可以脱离 dsh 单测：
 
 ```sh
 node --test
@@ -197,6 +243,16 @@ applyHost(ctx, {}, fake.deps);                      // applyHost 默认注入静
 映像加载、完全不认 shebang**，`spawn` 必然失败，于是四条依赖「脚本真的发出去了」的用例在 Windows
 上永远红。现在的做法在三个平台跑同一条路径，测试也不再有任何真实副作用（不弹通知、不写注册表、
 不 spawn 真的 `wscript.exe`）。
+
+假 `ctx` 另外实现了 `provide`（记进 `ctx.services`），`tests/host.test.mjs` 据此断言 `awayNotify`
+的服务面，并验证「被抑制的会话确实不再产生通知脚本、释放后恢复」「规则能拿到 `pageAttended`」，
+`tests/client.test.mjs` 用最小 DOM 桩验证揭示目标的优先级（右栏 → 主视图 → 回执）。抑制是决策层的
+事，不能只测 `lib/suppress.js` 就以为接线是对的。
+
+跨插件的**服务注册与消费**则用工作区根目录下的 `.probe/verify-away-notify-suppression.mjs` 验证：
+把 away-notify 与 btw 的宿主半部装进同一个最小 cordis 语境，跑一遍「fork → 开面板且被看着就静音 →
+切走恢复提醒 → `pending-focus` 带回 reveal → 关面板后恢复 → aborted 永不提醒 → 别的会话不受影响」。
+包内的 `node --test` 覆盖不到这一环，但恰恰是最容易「两边都绿、合起来不工作」的地方。
 
 真实机器上的通知通道单独验证（会真的弹窗）：
 

@@ -238,11 +238,17 @@ Local\dsh-away-notify-focus-helper-<SHA1(小写、去掉尾部分隔符的 spool
 1. 发通知时宿主记下 `pendingFocus = { sessionId, at }`（默认有效期 90 秒，`focusTtlMs`）；
 2. 浏览器半部在**页面加载时**、以及**每次重新获得焦点 / 页面可见时**，调用
    `POST /api/dsh-away-notify {op:'pending-focus'}` 索取目标会话；
-3. 拿到就切会话（dsh 0.1.6 调 `sessions.open(sessionId)`，0.1.7 起改调
-   `uiWorkspace.openSession(sessionId)`），然后 `{op:'ack-focus'}` 回执清除。
+3. 拿到后按优先级处理：
+   - **揭示目标**（若发通知的插件用 `awayNotify.revealSession` 声明过，回包里带
+     `reveal: { resource }`）：先 `ctx.sidebarRight.openResource(地址)`——那个 tab 已经开着就
+     **聚焦它**，没开就新开并展开右栏；这样侧边聊天之类的「插件自己的面板」会回到原 tab，
+     而不是在主视图里冒出一条会话。失败（没有 tab 类型认领 / 右栏服务缺失）继续走下一档；
+   - 否则切会话（dsh 0.1.6 调 `sessions.open(sessionId)`，0.1.7 起改调
+     `uiWorkspace.openSession(sessionId)`）。
+4. 两种情况都发 `{op:'ack-focus'}` 回执清除。
 
 因为第 2 步包含「重新获得焦点」，所以即使浏览器只是把已有窗口提到前台、并没有重新加载页面，
-那个页面也会自己切到目标会话。URL 上仍保留 `?dshAwayNotifyFocus=…` 作为兼容路径，但当前鉴权
-流程下通常到不了前端。
+那个页面也会自己切到目标会话。URL 上仍保留 `?dshAwayNotifyFocus=…` 作为兼容路径（它没有揭示
+目标可用，只能切会话），但当前鉴权流程下通常到不了前端。
 
 > 这也是为什么这个插件**必须带客户端半部**：会话跳转最终是由页面里的会话切换 API 完成的。

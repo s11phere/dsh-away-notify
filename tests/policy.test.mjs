@@ -157,3 +157,37 @@ test('buildBody 折叠空白字符', () => {
   const body = buildBody(ev({ sessionTitle: '', body: 'a\n\n  b\tc' }));
   assert.equal(body, 'a b c');
 });
+
+// ── 显式抑制（其它插件声明的「这条会话别打扰」）─────────────────────────────
+
+test('被显式抑制的会话不通知，原因带调用方标签', () => {
+  const r = decide(ev(), { isAttended: () => false, suppressionReason: () => 'dsh-btw-sidebar' });
+  assert.equal(r.notify, false);
+  assert.equal(r.reason, 'suppressed:dsh-btw-sidebar');
+});
+
+test('抑制优先于在场判定与冷却（无条件生效）', () => {
+  const r = decide(ev(), {
+    isAttended: () => true,
+    suppressionReason: () => 'plugin',
+  });
+  assert.equal(r.notify, false);
+  assert.equal(r.reason, 'suppressed:plugin');
+});
+
+test('suppressionReason 返回 undefined 时照常提醒', () => {
+  const r = decide(ev(), { isAttended: () => false, suppressionReason: () => undefined });
+  assert.equal(r.notify, true);
+});
+
+test('未接线 suppressionReason 时行为与从前一致', () => {
+  assert.equal(decide(ev(), { isAttended: () => false }).notify, true);
+  // 传了非函数也不应崩
+  assert.equal(decide(ev(), { isAttended: () => false, suppressionReason: 'nope' }).notify, true);
+});
+
+test('抑制按会话隔离：只压 s1，不压 s2', () => {
+  const deps = { isAttended: () => false, suppressionReason: (id) => (id === 's1' ? 'plugin' : undefined) };
+  assert.equal(decide(ev({ sessionId: 's1' }), deps).notify, false);
+  assert.equal(decide(ev({ sessionId: 's2' }), deps).notify, true);
+});

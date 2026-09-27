@@ -9,7 +9,7 @@ const PRESENCE_PATH = '/api/dsh-away-notify';
 const FOCUS_PARAM = 'dshAwayNotifyFocus';
 
 /** 建立最小 DOM 桩并加载 client.js，返回其导出。 */
-async function loadClientModule({ search = '', pendingFocusReply = null, titleTagReply } = {}) {
+async function loadClientModule({ search = '', pendingFocusReply = null, reveal = null, titleTagReply } = {}) {
   const listeners = [];
   const registrations = [];
   const observerInstances = [];
@@ -76,7 +76,7 @@ async function loadClientModule({ search = '', pendingFocusReply = null, titleTa
     }
     // 宿主的 pending-focus / config 应答由测试控制
     let payload = { ok: true };
-    if (reqBody.op === 'pending-focus') payload = { ok: true, sessionId: pendingFocusReply };
+    if (reqBody.op === 'pending-focus') payload = { ok: true, sessionId: pendingFocusReply, reveal };
     else if (reqBody.op === 'config' && titleTagReply !== undefined) {
       payload = { ok: true, titleTag: titleTagReply };
     }
@@ -130,9 +130,11 @@ function makeClientCtx({
   phase = 'ready',
   sessionsOpen = true,
   withWorkspace = false,
+  sidebar = 'none',
 } = {}) {
   const opened = [];
   const openedViaWorkspace = [];
+  const openedResources = [];
   const subscribed = [];
   const injectedDeps = [];
   const disposers = [];
@@ -165,6 +167,7 @@ function makeClientCtx({
     },
     opened,
     openedViaWorkspace,
+    openedResources,
     subscribed,
     injectedDeps,
     dispose: () => {
@@ -174,6 +177,16 @@ function makeClientCtx({
   // dsh 0.1.7 的会话切换服务
   if (withWorkspace) {
     ctx.uiWorkspace = { openSession: (id) => openedViaWorkspace.push(id) };
+  }
+  // 右栏服务：`ok` 记录打开的地址；`throws` 模拟「没有 tab 类型认领这个地址」
+  if (sidebar === 'ok') {
+    ctx.sidebarRight = { openResource: (address) => openedResources.push(address) };
+  } else if (sidebar === 'throws') {
+    ctx.sidebarRight = {
+      openResource: () => {
+        throw new Error('sidebarRight: no registered tab type claims it');
+      },
+    };
   }
   return ctx;
 }
@@ -213,9 +226,9 @@ test('导出 apply 与 inject，且刻意不声明 inject 依赖（避免 apply 
   assert.deepEqual(mod.clientModule.inject, [], 'inject 必须为空，否则 sessions 不可用时插件会完全静默');
 });
 
-test('apply 内部按需注入 sessions 与 uiWorkspace（都不写进 inject 数组，避免被阻塞）', async () => {
+test('apply 内部按需注入 sessions、uiWorkspace 与 sidebarRight（都不写进 inject 数组，避免被阻塞）', async () => {
   const { ctx } = await boot();
-  assert.deepEqual(ctx.injectedDeps, [['sessions'], ['uiWorkspace']]);
+  assert.deepEqual(ctx.injectedDeps, [['sessions'], ['uiWorkspace'], ['sidebarRight']]);
 });
 
 test('apply 后立即上报一次 presence 到正确端点', async () => {
@@ -445,6 +458,62 @@ test('宿主没有待跳转会话时什么都不做', async () => {
     false,
     '没有目标就不该回执',
   );
+});
+
+// ── 揭示目标：点通知回到插件自己的右栏 tab ──────────────────────────────────
+
+const REVEAL = { resource: 'dsh-resource://btw/session/s-side', reason: 'dsh-btw-sidebar' };
+
+test('带揭示目标时把资源开在右栏，而不是在主视图新开一条会话', async () => {
+  const { mod, ctx } = await boot(
+    { pendingFocusReply: 's-side', reveal: REVEAL },
+    { sessionsOpen: false, withWorkspace: true, sidebar: 'ok' },
+  );
+  await new Promise((r) => setTimeout(r, 30));
+  assert.deepEqual(ctx.openedResources, [REVEAL.resource], '应交给右栏打开/聚焦那个 tab');
+  assert.deepEqual(ctx.openedViaWorkspace, [], '不该再切主视图');
+  const ack = mod.fetchCalls.find((c) => JSON.parse(c.init.body).op === 'ack-focus');
+  assert.equal(JSON.parse(ack.init.body).sessionId, 's-side', '仍然要回执，避免重复跳转');
+});
+
+test('右栏拒绝打开（没有 tab 类型认领）时退回主视图', async () => {
+  const { mod, ctx } = await boot(
+    { pendingFocusReply: 's-side', reveal: REVEAL },
+    { byId: { s1: {}, s2: {}, 's-side': {} }, sessionsOpen: false, withWorkspace: true, sidebar: 'throws' },
+  );
+  await new Promise((r) => setTimeout(r, 30));
+  assert.deepEqual(ctx.openedResources, []);
+  assert.deepEqual(ctx.openedViaWorkspace, ['s-side'], '右栏打不开就必须退回主视图，别让点击变成没反应');
+  assert.ok(mod.fetchCalls.some((c) => JSON.parse(c.init.body).op === 'ack-focus'));
+});
+
+test('右栏服务缺失时退回主视图', async () => {
+  const { ctx } = await boot(
+    { pendingFocusReply: 's-side', reveal: REVEAL },
+    { byId: { s1: {}, s2: {}, 's-side': {} }, sessionsOpen: false, withWorkspace: true },
+  );
+  await new Promise((r) => setTimeout(r, 30));
+  assert.deepEqual(ctx.openedResources, []);
+  assert.deepEqual(ctx.openedViaWorkspace, ['s-side']);
+});
+
+test('没有揭示目标时行为不变（切主视图）', async () => {
+  const { ctx } = await boot(
+    { pendingFocusReply: 's2', reveal: null },
+    { sessionsOpen: false, withWorkspace: true, sidebar: 'ok' },
+  );
+  await new Promise((r) => setTimeout(r, 30));
+  assert.deepEqual(ctx.openedResources, []);
+  assert.deepEqual(ctx.openedViaWorkspace, ['s2']);
+});
+
+test('已经在目标会话上时优先回执，不去开右栏', async () => {
+  const { ctx } = await boot(
+    { pendingFocusReply: 's1', reveal: REVEAL },
+    { current: 's1', sidebar: 'ok' },
+  );
+  await new Promise((r) => setTimeout(r, 30));
+  assert.deepEqual(ctx.openedResources, [], '已经在目标会话上就不该再开面板');
 });
 
 test('重新获得焦点时再次索取待跳转会话（浏览器只聚焦不重载的场景）', async () => {

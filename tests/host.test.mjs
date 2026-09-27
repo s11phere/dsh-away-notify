@@ -47,6 +47,7 @@ function makeCtx() {
   const handlers = new Map();
   const effects = [];
   const fetchRoutes = new Map();
+  const services = new Map();
   const logs = [];
   const disposers = [];
   const ctx = {
@@ -68,6 +69,10 @@ function makeCtx() {
       if (name === 'webServer') return { port: 3081 };
       if (name === 'connection') return ctx.connection;
       return undefined;
+    },
+    provide(name, value) {
+      services.set(name, value);
+      return () => services.delete(name);
     },
     connection: undefined,
     on(event, handler) {
@@ -102,6 +107,7 @@ function makeCtx() {
     logs,
     fetchRoutes,
     effects,
+    services,
   };
   created.push(ctx);
   return ctx;
@@ -627,4 +633,245 @@ test('启动助手时交给 wscript 的路径必须是 Windows 形式（否则�
   );
   assert.match(src, /'\/\/B'/, '//B 批处理模式：即使将来出错也只静默失败，不弹窗');
   assert.doesNotMatch(src, /\bLAUNCHER_VBS,\s*HELPER_PS1\b/, '不得把 WSL 路径直接交给 wscript');
+});
+
+// ── 显式抑制接口（awayNotify 服务）──────────────────────────────────────────
+//
+// 这是给 dsh-btw-sidebar 这类插件用的扩展点：侧边聊天是普通 fork 会话，浏览器半部
+// 上报的「当前会话」永远是主视图那条，所以宿主的在场判定认不出它——必须由 btw 显式
+// 声明抑制。这里既验接口面，也验「抑制真的能拦住通知脚本」。
+
+/** 确认服务已提供，并返回它。 */
+function awayNotifyOf(ctx) {
+  const service = ctx.services.get('awayNotify');
+  assert.ok(service, '应提供 awayNotify 服务');
+  return service;
+}
+
+test('加载时提供 awayNotify 服务，接口面带版本号', () => {
+  const ctx = makeCtx();
+  applyHost(ctx, {});
+  const service = awayNotifyOf(ctx);
+  assert.equal(service.version, 1);
+  for (const method of [
+    'suppressSession',
+    'releaseSession',
+    'isSuppressed',
+    'addRule',
+    'revealSession',
+    'revealFor',
+    'snapshot',
+  ]) {
+    assert.equal(typeof service[method], 'function', `${method} 应是函数`);
+  }
+  assert.ok(ctx.logs.some(([lvl, msg]) => lvl === 'info' && /awayNotify/.test(msg)));
+});
+
+test('context.provide 抛错时只告警，通知链路照常', () => {
+  const ctx = makeCtx();
+  ctx.provide = () => {
+    throw new Error('cannot provide');
+  };
+  assert.doesNotThrow(() => applyHost(ctx, {}));
+  assert.ok(ctx.logs.some(([lvl, msg]) => lvl === 'warn' && /awayNotify 服务失败/.test(msg)));
+});
+
+test('被显式抑制的会话不弹通知，释放后恢复', async () => {
+  const fake = makeFakeSpawn();
+  const restore = pretendWindows(fake.psPath);
+  try {
+    const ctx = makeCtx();
+    applyHost(ctx, {}, fake.deps);
+    const away = awayNotifyOf(ctx);
+    ctx.sessions.add(session('s-side'));
+
+    // 模拟 btw：fork 成功后立刻声明抑制
+    const release = away.suppressSession('s-side', 'dsh-btw-sidebar');
+    assert.equal(away.isSuppressed('s-side'), 'dsh-btw-sidebar');
+
+    ctx.emit('session/event', ctx.sessions.get('s-side'), turnEnd());
+    await settle();
+    assert.ok(
+      !readScripts(fake.logPath).some((s) => s.includes('cmVtaW5kZXI=')),
+      '被抑制的会话不应发出任何通知',
+    );
+
+    // 释放后同类事件照常提醒（冷却未消耗：抑制发生在冷却之前）
+    release();
+    assert.equal(away.isSuppressed('s-side'), undefined);
+    ctx.emit('session/event', ctx.sessions.get('s-side'), turnEnd(2));
+    await settle();
+    assert.ok(
+      readScripts(fake.logPath).some((s) => s.includes('cmVtaW5kZXI=')),
+      '释放后应恢复提醒',
+    );
+  } finally {
+    restore();
+    fake.cleanup();
+  }
+});
+
+test('抑制只作用于目标会话，别的会话照常提醒', async () => {
+  const fake = makeFakeSpawn();
+  const restore = pretendWindows(fake.psPath);
+  try {
+    const ctx = makeCtx();
+    applyHost(ctx, {}, fake.deps);
+    awayNotifyOf(ctx).suppressSession('s-side', 'dsh-btw-sidebar');
+    ctx.sessions.add(session('s-side'));
+    ctx.sessions.add(session('s-main'));
+
+    ctx.emit('session/event', ctx.sessions.get('s-main'), turnEnd());
+    await settle();
+    const scripts = readScripts(fake.logPath).filter((s) => s.includes('cmVtaW5kZXI='));
+    assert.equal(scripts.length, 1, '主会话应照常提醒');
+    // 通知正文在脚本里是 base64（见 notifier.js 的 __BODY_B64__），解出来核对会话
+    const encoded = [...scripts[0].matchAll(/DecB64 "([^"]*)"/g)].map((m) => m[1]);
+    assert.match(Buffer.from(encoded[1] ?? '', 'base64').toString('utf8'), /会话s-main/, '提醒的必须是主会话');
+  } finally {
+    restore();
+    fake.cleanup();
+  }
+});
+
+test('addRule 按「类」抑制；规则抛错时视为不抑制（宁可多弹）', async () => {
+  const fake = makeFakeSpawn();
+  const restore = pretendWindows(fake.psPath);
+  try {
+    const ctx = makeCtx();
+    applyHost(ctx, {}, fake.deps);
+    const away = awayNotifyOf(ctx);
+    const disposeRule = away.addRule({
+      id: 'test-plugin',
+      reason: 'test-plugin',
+      match: (sid) => sid.startsWith('side-'),
+    });
+    ctx.sessions.add(session('side-1'));
+    ctx.emit('session/event', ctx.sessions.get('side-1'), turnEnd());
+    await settle();
+    assert.ok(!readScripts(fake.logPath).some((s) => s.includes('cmVtaW5kZXI=')));
+
+    disposeRule();
+    assert.equal(away.isSuppressed('side-1'), undefined);
+
+    away.addRule({
+      id: 'boom',
+      reason: 'boom',
+      match: () => {
+        throw new Error('rule boom');
+      },
+    });
+    assert.equal(away.isSuppressed('side-1'), undefined, '规则抛错不得抑制');
+    assert.ok(
+      away.snapshot().rules.some((r) => r.id === 'boom' && /rule boom/.test(r.error ?? '')),
+      '规则错误要能在诊断里看到',
+    );
+  } finally {
+    restore();
+    fake.cleanup();
+  }
+});
+
+test('state 端点回显被抑制的会话，便于排障', async () => {
+  const ctx = makeCtx();
+  applyHost(ctx, {});
+  awayNotifyOf(ctx).suppressSession('s-side', 'dsh-btw-sidebar');
+  const { body } = await callEndpoint(ctx, { op: 'state' });
+  assert.deepEqual(body.suppressed.sessions, [{ sessionId: 's-side', reason: 'dsh-btw-sidebar' }]);
+});
+
+// ── 规则上下文与点击揭示 ────────────────────────────────────────────────────
+
+/** 已发出的通知脚本（按 reminder 标记识别，避免把协议注册脚本也算进来）。 */
+const reminderScripts = (fake) => readScripts(fake.logPath).filter((s) => s.includes('cmVtaW5kZXI='));
+
+test('规则能拿到在场上下文：页面被看着时才抑制，没人看时照常提醒', async () => {
+  const fake = makeFakeSpawn();
+  const restore = pretendWindows(fake.psPath);
+  try {
+    const ctx = makeCtx();
+    applyHost(ctx, { cooldownMs: 0 }, fake.deps);
+    awayNotifyOf(ctx).addRule({
+      id: 'only-while-watched',
+      reason: 'watched',
+      match: (_sid, _event, context) => context?.pageAttended === true,
+    });
+    ctx.sessions.add(session('s1'));
+
+    // 没人看页面：规则不命中 → 照常提醒
+    ctx.emit('session/event', ctx.sessions.get('s1'), turnEnd(1));
+    await settle();
+    assert.equal(reminderScripts(fake).length, 1, '没人看页面时应提醒');
+
+    // 有人看着页面（浏览器心跳可见 + 有焦点）：规则命中 → 抑制
+    await reportPresence(ctx, 's1', true, true);
+    ctx.emit('session/event', ctx.sessions.get('s1'), turnEnd(2));
+    await settle();
+    assert.equal(reminderScripts(fake).length, 1, '页面被看着时规则应命中，不再新增通知');
+  } finally {
+    restore();
+    fake.cleanup();
+  }
+});
+
+test('pending-focus 带上调用方声明的揭示目标', async () => {
+  const fake = makeFakeSpawn();
+  const restore = pretendWindows(fake.psPath);
+  try {
+    const ctx = makeCtx();
+    applyHost(ctx, {}, fake.deps);
+    const away = awayNotifyOf(ctx);
+    away.revealSession('s-side', { resource: 'dsh-resource://btw/session/s-side', reason: 'dsh-btw-sidebar' });
+    ctx.sessions.add(session('s-side'));
+
+    ctx.emit('session/event', ctx.sessions.get('s-side'), turnEnd());
+    await settle();
+
+    const { body } = await callEndpoint(ctx, { op: 'pending-focus' });
+    assert.equal(body.sessionId, 's-side');
+    assert.deepEqual(body.reveal, {
+      resource: 'dsh-resource://btw/session/s-side',
+      reason: 'dsh-btw-sidebar',
+    });
+  } finally {
+    restore();
+    fake.cleanup();
+  }
+});
+
+test('没有揭示目标时 pending-focus 回 null（浏览器半部退回主视图）', async () => {
+  const fake = makeFakeSpawn();
+  const restore = pretendWindows(fake.psPath);
+  try {
+    const ctx = makeCtx();
+    applyHost(ctx, {}, fake.deps);
+    ctx.sessions.add(session('s1'));
+    ctx.emit('session/event', ctx.sessions.get('s1'), turnEnd());
+    await settle();
+
+    const { body } = await callEndpoint(ctx, { op: 'pending-focus' });
+    assert.equal(body.sessionId, 's1');
+    assert.equal(body.reveal, null);
+  } finally {
+    restore();
+    fake.cleanup();
+  }
+});
+
+test('没有待跳转会话时也回 reveal:null，而不是省略字段', async () => {
+  const ctx = makeCtx();
+  applyHost(ctx, {});
+  const { body } = await callEndpoint(ctx, { op: 'pending-focus' });
+  assert.equal(body.sessionId, null);
+  assert.equal(body.reveal, null);
+});
+
+test('揭示目标也进 state 诊断', async () => {
+  const ctx = makeCtx();
+  applyHost(ctx, {});
+  awayNotifyOf(ctx).revealSession('s-side', { resource: 'dsh-resource://btw/session/s-side', reason: 'btw' });
+  const { body } = await callEndpoint(ctx, { op: 'state' });
+  assert.deepEqual(body.suppressed.sessions, [
+    { sessionId: 's-side', reveal: { resource: 'dsh-resource://btw/session/s-side', reason: 'btw' } },
+  ]);
 });
