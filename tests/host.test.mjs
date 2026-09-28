@@ -9,7 +9,16 @@ import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFil
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-const { apply, DEFAULTS } = await import('../lib/host.js');
+const { apply, DEFAULTS, inject: HOST_INJECT } = await import('../lib/host.js');
+
+/**
+ * 假 ctx 里「允许直接属性读取」的服务集合。
+ *
+ * 从被测模块现取，而不是手写一份：它必须永远跟着 `lib/host.js` 的 `inject` 走。
+ * 一旦有人把某个服务从 `inject` 里拿掉却仍在代码里直接 `ctx.<service>` 读，假 ctx
+ * 就要和真 cordis 一样立刻抛错，而不是继续放行。
+ */
+const DIRECT_READABLE = new Set(HOST_INJECT ?? []);
 
 const PRESENCE_PATH = '/api/dsh-away-notify';
 
@@ -42,7 +51,23 @@ afterEach(() => {
   }
 });
 
-/** 构造一个够用的假 Cordis ctx。 */
+/**
+ * 构造一个够用的假 Cordis ctx。
+ *
+ * **直接属性读取服务必须和真 cordis 一样严格。** 真 cordis 里读一个没写进 `inject`
+ * 的服务会抛 `cannot get property "x" without inject`；只有 `ctx.get(name)` 是官方的
+ * 可选查找（服务缺失返回 undefined，声明与否都不抛）。两种语义都必须在假 ctx 里成立，
+ * 否则「单测全绿、真机静默失效」会重演：
+ *
+ * `lib/host.js` 的 `titleOf` 曾经用 `ctx.sessionTitle` / `ctx.sessionProjections` 读
+ * 会话标题。而当时的假 ctx 恰好与真机相反——把 `sessionTitle` 当普通属性直挂（读得到），
+ * `get()` 又不认识它（返回 undefined）。于是「通知正文里的会话标题」在真机上从未出现过，
+ * 单测却始终是绿的：`titleOf` 里的两处 try/catch 把真机的 TypeError 吞掉了。
+ * 回归用例见 `会话标题必须进到通知正文里`。
+ *
+ * `ctx.inject(deps, cb)` 的回调拿到的是「这些服务已注入」的派生 ctx：只有 `deps` 里的
+ * 服务在那个回调内允许直接属性读取（真 cordis 的 scope 语义）。
+ */
 function makeCtx() {
   const handlers = new Map();
   const effects = [];
@@ -50,31 +75,42 @@ function makeCtx() {
   const services = new Map();
   const logs = [];
   const disposers = [];
-  const ctx = {
+
+  /** 会话服务：同真机一样登记为「服务」，直接读取的许可由 DIRECT_READABLE 决定。 */
+  const sessions = {
+    _map: new Map(),
+    get(id) {
+      return this._map.get(id);
+    },
+    add(session) {
+      this._map.set(session.id, session);
+    },
+  };
+
+  /** 容器在插件 apply 之前就已就绪的服务（真机上可能更晚，故插件仍须容忍缺失）。 */
+  services.set('sessions', sessions);
+  services.set('webServer', { port: 3081 });
+  services.set('sessionTitle', { get: (s) => ({ title: s.__title }) });
+  services.set('sessionProjections', {
+    snapshot: (s, keys) =>
+      keys.includes('title') && typeof s?.__title === 'string'
+        ? { values: { title: s.__title } }
+        : { values: {} },
+  });
+
+  const raw = {
     logger: {
       info: (...a) => logs.push(['info', ...a]),
       warn: (...a) => logs.push(['warn', ...a]),
     },
-    sessions: {
-      _map: new Map(),
-      get(id) {
-        return this._map.get(id);
-      },
-      add(session) {
-        this._map.set(session.id, session);
-      },
-    },
-    sessionTitle: { get: (s) => ({ title: s.__title }) },
+    /** 只认已注册的服务；未注册与真 cordis 一致地返回 undefined，任何情况下都不抛。 */
     get(name) {
-      if (name === 'webServer') return { port: 3081 };
-      if (name === 'connection') return ctx.connection;
-      return undefined;
+      return services.get(name);
     },
     provide(name, value) {
       services.set(name, value);
       return () => services.delete(name);
     },
-    connection: undefined,
     on(event, handler) {
       const list = handlers.get(event) ?? [];
       list.push(handler);
@@ -83,9 +119,9 @@ function makeCtx() {
     },
     inject(deps, cb) {
       if (deps.includes('connection')) {
-        ctx.connection = { fetch: { register: (route) => fetchRoutes.set(route.path, route) } };
+        services.set('connection', { fetch: { register: (route) => fetchRoutes.set(route.path, route) } });
       }
-      cb(ctx);
+      cb(withInject(deps));
     },
     effect(fn) {
       const disposer = fn();
@@ -109,6 +145,35 @@ function makeCtx() {
     effects,
     services,
   };
+
+  /**
+   * 包一层：服务只经由服务层暴露，读「已注册但未注入」的服务就抛真 cordis 的那条错误。
+   *
+   * @param {string[]} [extraInject] - `ctx.inject(deps, cb)` 回调里额外可视的服务。
+   * @returns {object} 供 `apply` 使用的 ctx。
+   */
+  function withInject(extraInject = []) {
+    const allowed = new Set([...DIRECT_READABLE, ...extraInject]);
+    return new Proxy(raw, {
+      get(target, prop, receiver) {
+        if (typeof prop === 'string' && services.has(prop)) {
+          if (!allowed.has(prop)) throw new Error(`cannot get property "${prop}" without inject`);
+          return services.get(prop);
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+      set(target, prop, value, receiver) {
+        // 用例里常见的 `ctx.sessionTitle = …`：语义等同于把这个服务重新注册一遍。
+        if (typeof prop === 'string' && services.has(prop)) {
+          services.set(prop, value);
+          return true;
+        }
+        return Reflect.set(target, prop, value, receiver);
+      },
+    });
+  }
+
+  const ctx = withInject();
   created.push(ctx);
   return ctx;
 }
@@ -728,6 +793,47 @@ test('抑制只作用于目标会话，别的会话照常提醒', async () => {
     // 通知正文在脚本里是 base64（见 notifier.js 的 __BODY_B64__），解出来核对会话
     const encoded = [...scripts[0].matchAll(/DecB64 "([^"]*)"/g)].map((m) => m[1]);
     assert.match(Buffer.from(encoded[1] ?? '', 'base64').toString('utf8'), /会话s-main/, '提醒的必须是主会话');
+  } finally {
+    restore();
+    fake.cleanup();
+  }
+});
+
+/**
+ * 回归：会话标题必须真的进到通知正文里。
+ *
+ * 这条用例专门给 `titleOf` 的「直接属性读服务」这个坑站岗。假 ctx 现在与真 cordis 一致：
+ * 读「已注册但没写进 `inject`」的服务会抛 `cannot get property "x" without inject`。
+ * 所以只要有人把 `ctx.get('sessionTitle')` 改回 `ctx.sessionTitle`，`titleOf` 里的
+ * try/catch 就会把异常吞掉、标题静默消失，这条断言立刻变红——这正是它在真机上失效
+ * 却在旧测试里看不出来的原因（旧假 ctx 把 `sessionTitle` 当普通属性直挂）。
+ *
+ * 后两行反过来钉住「假 ctx 确实足够严格」这个前提，避免哪天假 ctx 又被放宽、
+ * 让上面的断言失去意义。
+ */
+test('会话标题必须进到通知正文里（直接属性读取在真 cordis 上会抛）', async () => {
+  const fake = makeFakeSpawn();
+  const restore = pretendWindows(fake.psPath);
+  try {
+    const ctx = makeCtx();
+    applyHost(ctx, {}, fake.deps);
+    ctx.sessions.add(session('s-title'));
+
+    ctx.emit('session/event', ctx.sessions.get('s-title'), turnEnd());
+    await settle();
+
+    const scripts = readScripts(fake.logPath).filter((s) => s.includes('cmVtaW5kZXI='));
+    assert.equal(scripts.length, 1, '应提醒一次');
+    const encoded = [...scripts[0].matchAll(/DecB64 "([^"]*)"/g)].map((m) => m[1]);
+    assert.match(
+      Buffer.from(encoded[1] ?? '', 'base64').toString('utf8'),
+      /会话s-title/,
+      '会话标题应出现在通知正文里，而不是因为服务读取方式不对被静默丢掉',
+    );
+
+    // 前提校验：直接属性读取必须真的抛，`ctx.get()` 才拿得到。
+    assert.throws(() => ctx.sessionTitle, /cannot get property "sessionTitle" without inject/);
+    assert.equal(ctx.get('sessionTitle').get(ctx.sessions.get('s-title')).title, '会话s-title');
   } finally {
     restore();
     fake.cleanup();

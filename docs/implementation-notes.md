@@ -223,6 +223,16 @@ reason、`goal/change` 的 `complete`/`block`、`approval/asked` 的 `toolName`/
    否则「窗口提到了前台、人却还在原来那个标签页上」。这一条不是 dsh 版本问题，纯 Windows /
    Chromium 行为，详见[点击回跳的实测](./click-focus.md#实测最小化的浏览器窗口对-uia-不暴露标签页)。
 
+10. **不能直接属性读「没写进 `inject` 的服务」，要用 `ctx.get(name)`**。cordis 对这类读取抛
+    `cannot get property "<name>" without inject`；`ctx.get` 才是官方的可选查找（服务缺失返回
+    `undefined`，声明与否都不抛）。第 1 条 `connection.rpc.handle` 的根因正是这条规则。
+    `titleOf()` 也踩过：它用 `ctx.sessionTitle` / `ctx.sessionProjections` 读会话标题，而本插件
+    `inject` 只有 `['sessions']`，于是两处都在真机上抛错、又被自己的 `try/catch` 吞掉——**通知正文
+    里的会话标题从未出现过**，单测却一直全绿：当时的假 `ctx` 恰好与真 cordis 相反（把 `sessionTitle`
+    当普通属性直挂、`get()` 又不认识它），而这个「假替身比真机宽松」的偏差，单靠单测是发现不了的。
+    2026-09-28 修掉（改走 `ctx.get`），同时把假 `ctx` 改成与真 cordis 同样严格（见 §5），
+    回归用例：`会话标题必须进到通知正文里`。
+
 ---
 
 ## 5. 测试约定
@@ -252,6 +262,14 @@ applyHost(ctx, {}, fake.deps);                      // applyHost 默认注入静
 `tests/client.test.mjs` 用最小 DOM 桩验证揭示目标的优先级（右栏 → 主视图 → 回执），以及跨会话
 揭示的时序（先切归属会话 → 等 `mounted` → 才 `openResource`；右栏还没挂载过去时**不得**开）。
 抑制是决策层的事，不能只测 `lib/suppress.js` 就以为接线是对的。
+
+假 `ctx` 还刻意复刻了真 cordis 的**服务读取严格性**：读「已注册但没写进 `lib/host.js` 的 `inject`」
+的服务会抛 `cannot get property "<name>" without inject`，只有 `ctx.get()` 拿得到；
+`ctx.inject(deps, cb)` 的回调里则只有 `deps` 内的服务可视。这不是为了仿真而仿真——正是这条差异
+让 §4.2 第 10 条的标题缺陷在旧测试里完全隐形（旧假 `ctx` 把 `sessionTitle` 当普通属性直挂）。
+给假 `ctx` 添服务时请一并登记进 `services`，别让它退化成「比真机宽松」的样子；真要复核某条服务
+契约在真 runtime 下成不成立，用工作区根目录（**不在本仓库内**）的
+`dsh-upgrade-compatibility-check.md` §6 那套「真 runtime 复核」写法。
 
 跨插件的**服务注册与消费**则用工作区根目录下的 `.probe/verify-away-notify-suppression.mjs` 验证：
 把 away-notify 与 btw 的宿主半部装进同一个最小 cordis 语境，跑一遍「fork → 开面板且被看着就静音 →
