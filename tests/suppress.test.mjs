@@ -169,6 +169,41 @@ test('resource 无效时不登记', () => {
   assert.equal(registry.revealFor('s1'), undefined);
 });
 
+test('reveal 可带归属主视图会话；不带时形状与旧版一致', () => {
+  const registry = new SuppressionRegistry();
+  registry.reveal('s1', { resource: 'dsh-resource://btw/session/s1', reason: 'btw' });
+  registry.reveal('s2', {
+    resource: 'dsh-resource://btw/session/s2',
+    mainSessionId: 'm-2',
+    reason: 'btw',
+  });
+  assert.deepEqual(registry.revealFor('s1'), {
+    resource: 'dsh-resource://btw/session/s1',
+    reason: 'btw',
+  }, '没给归属时不得凭空多出字段');
+  assert.deepEqual(registry.revealFor('s2'), {
+    resource: 'dsh-resource://btw/session/s2',
+    mainSessionId: 'm-2',
+    reason: 'btw',
+  });
+});
+
+test('reveal 的 mainSessionId 无效时忽略（不写进揭示目标）', () => {
+  const registry = new SuppressionRegistry();
+  registry.reveal('s1', { resource: 'dsh-resource://x', mainSessionId: '', reason: 'btw' });
+  registry.reveal('s2', { resource: 'dsh-resource://y', mainSessionId: 42, reason: 'btw' });
+  assert.equal('mainSessionId' in registry.revealFor('s1'), false);
+  assert.equal('mainSessionId' in registry.revealFor('s2'), false);
+});
+
+test('snapshot 把归属主视图会话一并回显（排障时能看出点击会切到哪儿）', () => {
+  const registry = new SuppressionRegistry();
+  registry.reveal('s1', { resource: 'dsh-resource://btw/session/s1', mainSessionId: 'm-1', reason: 'btw' });
+  assert.deepEqual(registry.snapshot().sessions, [
+    { sessionId: 's1', reveal: { resource: 'dsh-resource://btw/session/s1', mainSessionId: 'm-1', reason: 'btw' } },
+  ]);
+});
+
 test('抑制与揭示互不干扰：一条会话可以两者都有', () => {
   const registry = new SuppressionRegistry();
   registry.claim('s1', 'a');

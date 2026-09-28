@@ -131,14 +131,27 @@ function makeClientCtx({
   sessionsOpen = true,
   withWorkspace = false,
   sidebar = 'none',
+  autoMountSession = false,
+  mountedInitial = 's1',
+  withoutMountedObservable = false,
 } = {}) {
   const opened = [];
   const openedViaWorkspace = [];
   const openedResources = [];
+  /** 每次 openResource 时右栏挂载的会话；用来断言「没开错会话」。 */
+  const openedMounts = [];
   const subscribed = [];
   const injectedDeps = [];
   const disposers = [];
   const state = { current, byId, phase };
+  /** 右栏挂载会话的可观察量替身（sidebarRight.mounted）。 */
+  const mountState = { current: mountedInitial };
+  const noteOpen = (id) => {
+    if (!autoMountSession) return;
+    // 主视图切换是同步的；右栏 seat 随后 bind。测试里默认让它立即跟上。
+    state.current = id;
+    mountState.current = id;
+  };
   const sessions = {
     list: {
       getSnapshot: () => ({ ...state }),
@@ -149,7 +162,7 @@ function makeClientCtx({
     },
   };
   // dsh 0.1.7 的 ClientSessions 上已无 open；sessionsOpen:false 用来模拟它
-  if (sessionsOpen) sessions.open = (id) => opened.push(id);
+  if (sessionsOpen) sessions.open = (id) => { opened.push(id); noteOpen(id); };
   const ctx = {
     sessions,
     // 生产代码用 ctx.inject([...], cb) 在服务就绪后接管；
@@ -165,9 +178,13 @@ function makeClientCtx({
     setCurrent: (id) => {
       state.current = id;
     },
+    setMounted: (id) => {
+      mountState.current = id;
+    },
     opened,
     openedViaWorkspace,
     openedResources,
+    openedMounts,
     subscribed,
     injectedDeps,
     dispose: () => {
@@ -176,16 +193,33 @@ function makeClientCtx({
   };
   // dsh 0.1.7 的会话切换服务
   if (withWorkspace) {
-    ctx.uiWorkspace = { openSession: (id) => openedViaWorkspace.push(id) };
+    ctx.uiWorkspace = { openSession: (id) => { openedViaWorkspace.push(id); noteOpen(id); } };
   }
-  // 右栏服务：`ok` 记录打开的地址；`throws` 模拟「没有 tab 类型认领这个地址」
+  // 右栏服务：`ok` 记录打开的地址；`throws` 模拟「没有 tab 类型认领这个地址」。
+  // `mounted` 是官方服务上的可观察量（揭示跨会话时用来等它切过去）。
+  const mountedObservable =
+    withoutMountedObservable === true
+      ? {}
+      : {
+          mounted: {
+            getSnapshot: () => mountState.current,
+            subscribe: () => () => {},
+          },
+        };
   if (sidebar === 'ok') {
-    ctx.sidebarRight = { openResource: (address) => openedResources.push(address) };
+    ctx.sidebarRight = {
+      openResource: (address) => {
+        openedMounts.push(mountState.current);
+        openedResources.push(address);
+      },
+      ...mountedObservable,
+    };
   } else if (sidebar === 'throws') {
     ctx.sidebarRight = {
       openResource: () => {
         throw new Error('sidebarRight: no registered tab type claims it');
       },
+      ...mountedObservable,
     };
   }
   return ctx;
@@ -514,6 +548,157 @@ test('已经在目标会话上时优先回执，不去开右栏', async () => {
   );
   await new Promise((r) => setTimeout(r, 30));
   assert.deepEqual(ctx.openedResources, [], '已经在目标会话上就不该再开面板');
+});
+
+// ── 揭示目标的归属会话（右栏按主视图会话分域）─────────────────────────────────
+
+const OWNED_REVEAL = {
+  resource: 'dsh-resource://btw/session/s-side',
+  mainSessionId: 's-owner',
+  reason: 'dsh-btw-sidebar',
+};
+
+test('跨会话揭示：先切回归属会话，再在它的右栏里打开（而不是开进当前会话）', async () => {
+  const { mod, ctx } = await boot(
+    { pendingFocusReply: 's-side', reveal: OWNED_REVEAL },
+    {
+      current: 's-other',
+      byId: { 's-other': {}, 's-owner': {}, 's-side': {} },
+      sessionsOpen: false,
+      withWorkspace: true,
+      sidebar: 'ok',
+      autoMountSession: true,
+      mountedInitial: 's-other',
+    },
+  );
+  await new Promise((r) => setTimeout(r, 60));
+  assert.deepEqual(ctx.openedViaWorkspace, ['s-owner'], '必须先把主视图切回归属会话');
+  assert.deepEqual(ctx.openedResources, [OWNED_REVEAL.resource], '资源要交给右栏打开/聚焦');
+  assert.deepEqual(ctx.openedMounts, ['s-owner'], '打开时右栏必须已经挂载在归属会话上');
+  const ack = mod.fetchCalls.find((c) => JSON.parse(c.init.body).op === 'ack-focus');
+  assert.equal(JSON.parse(ack.init.body).sessionId, 's-side', '仍然要回执，避免重复跳转');
+});
+
+test('跨会话揭示：归属会话的右栏还没挂载时绝不硬开（否则就开进了当前会话）', async () => {
+  const { ctx } = await boot(
+    { pendingFocusReply: 's-side', reveal: OWNED_REVEAL },
+    {
+      current: 's-other',
+      byId: { 's-other': {}, 's-owner': {}, 's-side': {} },
+      sessionsOpen: false,
+      withWorkspace: true,
+      sidebar: 'ok',
+      autoMountSession: false,
+      mountedInitial: 's-other',
+    },
+  );
+  await new Promise((r) => setTimeout(r, 100));
+  assert.deepEqual(ctx.openedViaWorkspace, ['s-owner'], '主视图先切过去');
+  assert.deepEqual(ctx.openedResources, [], '右栏还挂在 s-other 上，这时打开就会开错会话');
+
+  // seat 随后 bind 到归属会话 → 这时才打开
+  ctx.setMounted('s-owner');
+  await new Promise((r) => setTimeout(r, 150));
+  assert.deepEqual(ctx.openedResources, [OWNED_REVEAL.resource]);
+  assert.deepEqual(ctx.openedMounts, ['s-owner']);
+});
+
+test('揭示目标没有归属信息时行为不变（直接开在当前会话）', async () => {
+  const { ctx } = await boot(
+    { pendingFocusReply: 's-side', reveal: REVEAL },
+    {
+      current: 's-other',
+      byId: { 's-other': {}, 's-side': {} },
+      sessionsOpen: false,
+      withWorkspace: true,
+      sidebar: 'ok',
+      autoMountSession: true,
+      mountedInitial: 's-other',
+    },
+  );
+  await new Promise((r) => setTimeout(r, 40));
+  assert.deepEqual(ctx.openedViaWorkspace, [], '没有归属就不该乱切主视图');
+  assert.deepEqual(ctx.openedResources, [REVEAL.resource]);
+});
+
+test('归属就是当前会话时不重复切换，直接开右栏', async () => {
+  const { ctx } = await boot(
+    { pendingFocusReply: 's-side', reveal: OWNED_REVEAL },
+    {
+      current: 's-owner',
+      byId: { 's-owner': {}, 's-side': {} },
+      sessionsOpen: false,
+      withWorkspace: true,
+      sidebar: 'ok',
+      mountedInitial: 's-owner',
+    },
+  );
+  await new Promise((r) => setTimeout(r, 40));
+  assert.deepEqual(ctx.openedViaWorkspace, [], '已经在归属会话上，不需要再切');
+  assert.deepEqual(ctx.openedResources, [OWNED_REVEAL.resource]);
+  assert.deepEqual(ctx.openedMounts, ['s-owner']);
+});
+
+test('页面刚加载、右栏还没有 seat 挂载时：就算归属会话已是当前会话也要等它 bind，不能立刻开', async () => {
+  const { ctx } = await boot(
+    { pendingFocusReply: 's-side', reveal: OWNED_REVEAL },
+    {
+      current: 's-owner',
+      byId: { 's-owner': {}, 's-side': {} },
+      sessionsOpen: false,
+      withWorkspace: true,
+      sidebar: 'ok',
+      autoMountSession: false,
+      // mounted 可观察量存在，但此刻还没有任何 seat bind（值为 undefined → null）
+      mountedInitial: null,
+    },
+  );
+  await new Promise((r) => setTimeout(r, 100));
+  assert.deepEqual(ctx.openedResources, [], '右栏还没挂载就开，会落进一个不存在/过期的 binding');
+
+  ctx.setMounted('s-owner');
+  await new Promise((r) => setTimeout(r, 150));
+  assert.deepEqual(ctx.openedResources, [OWNED_REVEAL.resource]);
+  assert.deepEqual(ctx.openedMounts, ['s-owner']);
+  assert.deepEqual(ctx.openedViaWorkspace, [], '已经在归属会话上，不需要重复切');
+});
+
+test('老版本右栏没有 mounted 可观察量时，退化为看主视图是否已切过去', async () => {
+  const { ctx } = await boot(
+    { pendingFocusReply: 's-side', reveal: OWNED_REVEAL },
+    {
+      current: 's-other',
+      byId: { 's-other': {}, 's-owner': {}, 's-side': {} },
+      sessionsOpen: false,
+      withWorkspace: true,
+      sidebar: 'ok',
+      autoMountSession: true,
+      mountedInitial: 's-other',
+      withoutMountedObservable: true,
+    },
+  );
+  await new Promise((r) => setTimeout(r, 60));
+  assert.deepEqual(ctx.openedViaWorkspace, ['s-owner']);
+  assert.deepEqual(ctx.openedResources, [OWNED_REVEAL.resource]);
+});
+
+test('归属会话的右栏打不开时，退回老规矩：切主视图那条会话（别让点击没反应）', async () => {
+  const { mod, ctx } = await boot(
+    { pendingFocusReply: 's-side', reveal: OWNED_REVEAL },
+    {
+      current: 's-other',
+      byId: { 's-other': {}, 's-owner': {}, 's-side': {} },
+      sessionsOpen: false,
+      withWorkspace: true,
+      sidebar: 'throws',
+      autoMountSession: true,
+      mountedInitial: 's-other',
+    },
+  );
+  await new Promise((r) => setTimeout(r, 60));
+  assert.deepEqual(ctx.openedViaWorkspace, ['s-owner', 's-side'], '先切回归属会话开右栏，失败才退回目标会话');
+  assert.deepEqual(ctx.openedResources, []);
+  assert.ok(mod.fetchCalls.some((c) => JSON.parse(c.init.body).op === 'ack-focus'));
 });
 
 test('重新获得焦点时再次索取待跳转会话（浏览器只聚焦不重载的场景）', async () => {

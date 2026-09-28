@@ -105,11 +105,14 @@ fetch('/api/dsh-away-notify',{method:'POST',headers:{'content-type':'application
 
 - `claim(sessionId, reason)` —— 逐条抑制，内部按自增 token 引用计数，返回释放函数；
   同一会话被多个插件声明时，一个释放不影响另一个。
-- `reveal(sessionId, { resource, reason })` —— 声明「点这条会话的通知时，先在右栏打开这个资源
-  地址」。地址对 away-notify 是不透明字符串，它只负责随 `op:'pending-focus'` 的应答转发；
-  浏览器半部拿它调 `ctx.sidebarRight.openResource(地址)`——右栏按 `contentId`（就是地址本身）
+- `reveal(sessionId, { resource, mainSessionId, reason })` —— 声明「点这条会话的通知时，先在右栏
+  打开这个资源地址」。地址对 away-notify 是不透明字符串，它只负责随 `op:'pending-focus'` 的应答
+  转发；浏览器半部拿它调 `ctx.sidebarRight.openResource(地址)`——右栏按 `contentId`（就是地址本身）
   查重，**已开着的 tab 会被聚焦而不是重复开一个**；没有 tab 类型认领 / 右栏服务缺失时抛错或
-  缺席，就地退回「切主视图那条会话」。
+  缺席，就地退回「切主视图那条会话」。可选的 `mainSessionId` 是「这个右栏属于哪条主视图会话」：
+  右栏状态按会话分域（`bySession[sessionId]`），`openResource` 只作用于当前挂载的那条，所以目标
+  不是当前会话时浏览器半部会先切过去、等 `sidebarRight.mounted` 确认再打开——不带它就退回旧行为
+  （直接开在当前会话里）。
 - `addRule({ id, reason, match })` —— 按「类」声明；`match(sessionId, event, context)` 的判断权
   在调用方，`context` 是宿主给的 `{ attended, pageAttended }`（「用户在看这条会话」/「用户在看
   dsh 页面」），于是「面板显示在右栏 **且** 你在看时才静音」这种语义不需要 away-notify 懂任何业务。
@@ -246,8 +249,9 @@ applyHost(ctx, {}, fake.deps);                      // applyHost 默认注入静
 
 假 `ctx` 另外实现了 `provide`（记进 `ctx.services`），`tests/host.test.mjs` 据此断言 `awayNotify`
 的服务面，并验证「被抑制的会话确实不再产生通知脚本、释放后恢复」「规则能拿到 `pageAttended`」，
-`tests/client.test.mjs` 用最小 DOM 桩验证揭示目标的优先级（右栏 → 主视图 → 回执）。抑制是决策层的
-事，不能只测 `lib/suppress.js` 就以为接线是对的。
+`tests/client.test.mjs` 用最小 DOM 桩验证揭示目标的优先级（右栏 → 主视图 → 回执），以及跨会话
+揭示的时序（先切归属会话 → 等 `mounted` → 才 `openResource`；右栏还没挂载过去时**不得**开）。
+抑制是决策层的事，不能只测 `lib/suppress.js` 就以为接线是对的。
 
 跨插件的**服务注册与消费**则用工作区根目录下的 `.probe/verify-away-notify-suppression.mjs` 验证：
 把 away-notify 与 btw 的宿主半部装进同一个最小 cordis 语境，跑一遍「fork → 开面板且被看着就静音 →

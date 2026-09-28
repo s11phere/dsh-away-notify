@@ -839,6 +839,35 @@ test('pending-focus 带上调用方声明的揭示目标', async () => {
   }
 });
 
+test('pending-focus 原样转发揭示目标的归属主视图会话（浏览器半部据此先切会话）', async () => {
+  const fake = makeFakeSpawn();
+  const restore = pretendWindows(fake.psPath);
+  try {
+    const ctx = makeCtx();
+    applyHost(ctx, {}, fake.deps);
+    const away = awayNotifyOf(ctx);
+    away.revealSession('s-side', {
+      resource: 'dsh-resource://btw/session/s-side',
+      mainSessionId: 's-owner',
+      reason: 'dsh-btw-sidebar',
+    });
+    ctx.sessions.add(session('s-side'));
+
+    ctx.emit('session/event', ctx.sessions.get('s-side'), turnEnd());
+    await settle();
+
+    const { body } = await callEndpoint(ctx, { op: 'pending-focus' });
+    assert.deepEqual(body.reveal, {
+      resource: 'dsh-resource://btw/session/s-side',
+      mainSessionId: 's-owner',
+      reason: 'dsh-btw-sidebar',
+    });
+  } finally {
+    restore();
+    fake.cleanup();
+  }
+});
+
 test('没有揭示目标时 pending-focus 回 null（浏览器半部退回主视图）', async () => {
   const fake = makeFakeSpawn();
   const restore = pretendWindows(fake.psPath);

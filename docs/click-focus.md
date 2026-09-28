@@ -240,9 +240,12 @@ Local\dsh-away-notify-focus-helper-<SHA1(小写、去掉尾部分隔符的 spool
    `POST /api/dsh-away-notify {op:'pending-focus'}` 索取目标会话；
 3. 拿到后按优先级处理：
    - **揭示目标**（若发通知的插件用 `awayNotify.revealSession` 声明过，回包里带
-     `reveal: { resource }`）：先 `ctx.sidebarRight.openResource(地址)`——那个 tab 已经开着就
-     **聚焦它**，没开就新开并展开右栏；这样侧边聊天之类的「插件自己的面板」会回到原 tab，
-     而不是在主视图里冒出一条会话。失败（没有 tab 类型认领 / 右栏服务缺失）继续走下一档；
+     `reveal: { resource, mainSessionId? }`）：先 `ctx.sidebarRight.openResource(地址)`——那个 tab
+     已经开着就**聚焦它**，没开就新开并展开右栏；这样侧边聊天之类的「插件自己的面板」会回到原
+     tab，而不是在主视图里冒出一条会话。带了 `mainSessionId`（该右栏所属的主视图会话）且它不是
+     当前会话时，会**先切主视图、等右栏挂载过去（`sidebarRight.mounted`）再打开**——右栏状态按
+     会话分域，不等就开只会落进当前那条会话的右栏。失败（没有 tab 类型认领 / 右栏服务缺失 /
+     3 秒内等不到挂载）继续走下一档；
    - 否则切会话（dsh 0.1.6 调 `sessions.open(sessionId)`，0.1.7 起改调
      `uiWorkspace.openSession(sessionId)`）。
 4. 两种情况都发 `{op:'ack-focus'}` 回执清除。
