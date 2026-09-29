@@ -163,6 +163,9 @@ node scripts\selftest-notify.mjs "标题" "正文"
 逐行写进日志文件。**确认通路后建议把这两项关掉**：`notifyOnLoad` 会让每次启动都弹一条自检，
 `debug` 的日志会一直增长。
 
+接线成功的标志：重启后应立刻收到一条 Toast，日志里出现 `已加载 (windows)` /
+`已注册 dshnotify: 协议` / `presence 端点已注册` / `焦点助手已启动`。
+
 ---
 
 ## 4. 约束：随包的 PowerShell 脚本必须**纯 ASCII**
@@ -191,6 +194,9 @@ Missing closing '}' in statement or block.
 `… — DeepSeek Harness [dsh:3080]`，聚焦脚本从点击 URL 的端口重建同一个 tag，
 **要求 marker 与 tag 同时命中**。所以点击 Windows 实例的通知不会跑到 WSL 那个标签页上去。
 
+回退开关：`titleTag: false` 会让浏览器不再打后缀，退回「只按 marker 匹配」的旧行为
+（多实例时会认错窗口）。
+
 两个实例在默认配置下还有两点共享，都是刻意的：
 
 - **共用同一个 `appId`**（默认 `DeepSeek Harness`）：通知中心里外观一致、静音设置也共享。
@@ -207,5 +213,5 @@ Missing closing '}' in statement or block.
 
 ## 6. 故障排查
 
-清单已经并入 [README 的「故障排查」一节](../README.md#故障排查)——那里是排查时最方便对照的位置，
+清单在 [故障排查](./troubleshooting.md)——那里是排查时最方便对照的位置，
 本文件负责的是每个现象背后的**原因**（§1 跨盘符、§2 残留助手、§3 通道自检）。
